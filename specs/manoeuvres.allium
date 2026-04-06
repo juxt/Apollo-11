@@ -1,0 +1,823 @@
+-- allium: 3
+-- Apollo Guidance Computer — Manoeuvre planning programs
+-- P30, P32/P33, P34/P35, P37, P70, and their LM equivalents (P72-P75)
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    manoeuvre: ManoeuvreState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- allium-ignore allium.definition.unused
+enum CentralBody { earth | moon }
+
+enum Vehicle { csm | lm }
+
+enum ActiveVehicle { active | passive }
+
+enum PropulsionSystem { sps | rcs }
+
+enum ManoeuvreProgram {
+    p30_external_delta_v
+    | p32_csi_csm
+    | p33_cdh_csm
+    | p34_tpi_csm
+    | p35_tpm_csm
+    | p37_return_to_earth
+    | p70_dps_abort
+    | p72_csi_lm
+    | p73_cdh_lm
+    | p74_tpi_lm
+    | p75_tpm_lm
+}
+
+enum ComputationPhase {
+    awaiting_input
+    | computing_conic
+    | computing_precision
+    | displaying_results
+    | accepted
+    | failed
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value BurnParameters {
+    -- Output common to all manoeuvre programs
+    tig: Decimal
+    delta_v_ref: List<Decimal>
+    delta_v_lv: List<Decimal>
+    delta_v_magnitude: Decimal
+    middle_gimbal_angle: Decimal
+
+    @guidance
+        -- TIG is time of ignition, scaled 2^28 centiseconds.
+        -- delta_v_ref is the delta-V in reference (inertial)
+        -- coordinates, stored in DELVSIN or DELVEET1/2/3.
+        -- delta_v_lv is in local vertical coordinates (DELVLVC),
+        -- the form displayed to the crew on the DSKY.
+        -- MGA (+MGA) is the middle gimbal angle; large values
+        -- warn of gimbal lock risk during the burn.
+}
+
+value OrbitParameters {
+    apoapsis_altitude: Decimal
+    periapsis_altitude: Decimal
+
+    @guidance
+        -- HAPO and HPER, scaled 2^29 metres. Computed by the
+        -- PERIAPO1 subroutine from position and velocity vectors.
+}
+
+value RendezvousGeometry {
+    -- Parameters specific to the CSI/CDH/TPI rendezvous sequence
+    delta_altitude_cdh: Decimal
+    time_csi_to_cdh: Decimal
+    time_cdh_to_tpi: Decimal
+    elevation_angle: Decimal
+    central_angle: Decimal
+    apsidal_crossings: Integer
+
+    @guidance
+        -- DIFFALT is the altitude difference at CDH. T1TOT2 and
+        -- T2TOT3 are the time intervals between sequence burns.
+        -- ELEV is the desired line-of-sight angle at TPI.
+        -- CENTANG is the passive vehicle transfer angle from TPI
+        -- to intercept. NN is the number of apsidal crossings
+        -- used to advance the active vehicle orbit to the CDH point.
+}
+
+value ReturnToEarthParameters {
+    -- P37-specific reentry targeting
+    entry_velocity: Decimal
+    transit_time: Decimal
+    flight_path_angle: Decimal
+    latitude_splashdown: Decimal
+    longitude_splashdown: Decimal
+    propulsion_option: PropulsionSystem
+
+    @guidance
+        -- VPRED is velocity magnitude at the 400,000 ft entry
+        -- interface. T3TOT4 is transit time to that altitude.
+        -- GAMMAEI is the flight path angle at entry. LAT(SPL)
+        -- and LNG(SPL) are the computed splashdown coordinates.
+        -- The crew selects SPS or RCS via OPTION2.
+}
+
+value ThrustProgramInterface {
+    -- Parameters passed to the thrusting programs (P40/P41)
+    tig: Decimal
+    target_position: List<Decimal>
+    intercept_time: Decimal
+    external_delta_v_steering: Boolean
+    cross_product_steering_constant: Decimal
+
+    @guidance
+        -- TIG, RTARG, TPASS4, XDELVFLG, ECSTEER. These registers
+        -- are the contract between the manoeuvre planning programs
+        -- and the powered flight programs. XDELVFLG selects between
+        -- external delta-V steering (set) and Lambert aimpoint
+        -- steering (cleared).
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity ManoeuvreState {
+    program: ManoeuvreProgram?
+    phase: ComputationPhase
+    active_vehicle: ActiveVehicle
+    vehicle: Vehicle
+
+    -- Current computation state
+    burn: BurnParameters?
+    orbit: OrbitParameters?
+    rendezvous: RendezvousGeometry?
+    rte_params: ReturnToEarthParameters?
+    thrust_interface: ThrustProgramInterface?
+
+    -- Iteration control for convergence loops
+    iteration_count: Integer
+    alarm_code: Integer?
+
+    -- Track marks since last thrusting manoeuvre
+    tracking_mark_count: Integer
+
+    -- Flags mirroring AGC state words
+    final_flag: Boolean
+    update_flag: Boolean
+    track_flag: Boolean
+
+    transitions phase {
+        awaiting_input -> computing_conic
+        computing_conic -> displaying_results
+        computing_conic -> failed
+        displaying_results -> computing_precision
+        displaying_results -> accepted
+        displaying_results -> awaiting_input
+        computing_precision -> displaying_results
+        computing_precision -> failed
+        failed -> awaiting_input
+        terminal: accepted
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Minimum time between sequential burns in the rendezvous
+    -- sequence (CSI->CDH, CDH->TPI). Source: 60MIN = 360000 cs.
+    min_inter_burn_interval: Decimal = 360000
+
+    -- Pericenter altitude safety limits
+    min_pericenter_earth: Decimal = 157420
+    min_pericenter_lunar: Decimal = 10668
+
+    -- P37 reentry interface altitude (400,000 ft in metres)
+    reentry_altitude: Decimal = 121920
+
+    -- CSI iteration limits
+    csi_max_iterations: Integer = 16
+    csi_convergence_epsilon: Decimal = 0.0003048
+    csi_max_delta_v: Decimal = 3.0480
+
+    -- P37 iteration alarm code
+    rte_excess_iterations_alarm: Integer = 605
+    rte_sphere_of_influence_alarm: Integer = 612
+
+    -- Rendezvous alarm codes
+    rendezvous_alarm_base: Integer = 600
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- P30: External Delta-V ----------------------------------------
+
+rule ExternalDeltaV {
+    -- P30 accepts an externally specified delta-V vector and
+    -- time of ignition from the crew. Computes burn parameters,
+    -- orbit after the burn, and the middle gimbal angle.
+    when: ExternalDeltaV(manoeuvre)
+
+    requires:
+        manoeuvre.program = p30_external_delta_v
+        manoeuvre.phase = awaiting_input
+
+    ensures:
+        manoeuvre.phase = computing_conic
+        let burn = ComputeBurnFromExternalDeltaV(
+            tig: manoeuvre.burn.tig,
+            delta_v_lv: manoeuvre.burn.delta_v_lv
+        )
+        manoeuvre.burn = burn
+        manoeuvre.orbit = ComputePostBurnOrbit(burn: burn)
+        manoeuvre.thrust_interface.external_delta_v_steering = true
+        manoeuvre.phase = displaying_results
+
+    @guidance
+        -- P30 flow: crew enters TIG via V06N33, then delta-V
+        -- in local vertical coords via V06N81. S30.1 integrates
+        -- the state vector to TIG (THISPREC), rotates delta-V
+        -- from local vertical to reference coordinates using the
+        -- LOMAT matrix, then computes apogee/perigee via PERIAPO1.
+        -- The program displays results via PARAM30 (V06N42).
+        -- XDELVFLG is set, selecting external delta-V steering
+        -- for the subsequent thrusting program.
+}
+
+-- P32/P72: Coelliptic Sequence Initiation ----------------------
+
+rule CoellipticSequenceInitiation {
+    -- Computes the CSI burn to establish a coelliptic orbit and
+    -- the subsequent CDH burn parameters. Iterates to converge
+    -- on a delta-V that produces the desired geometry.
+    when: CoellipticSequenceInitiation(manoeuvre)
+
+    requires:
+        manoeuvre.program = p32_csi_csm
+            or manoeuvre.program = p72_csi_lm
+        manoeuvre.phase = awaiting_input
+
+    ensures:
+        manoeuvre.phase = computing_conic
+        let result = ComputeCSI(
+            t_csi: manoeuvre.burn.tig,
+            t_tpi: manoeuvre.rendezvous.elevation_angle,
+            apsidal_crossings: manoeuvre.rendezvous.apsidal_crossings,
+            elevation: manoeuvre.rendezvous.elevation_angle
+        )
+        manoeuvre.burn = result.burn
+        manoeuvre.rendezvous.delta_altitude_cdh = result.delta_altitude
+        manoeuvre.rendezvous.time_csi_to_cdh = result.time_csi_to_cdh
+        manoeuvre.rendezvous.time_cdh_to_tpi = result.time_cdh_to_tpi
+        manoeuvre.thrust_interface.external_delta_v_steering = true
+        manoeuvre.phase = displaying_results
+
+    @guidance
+        -- P32/P72 flow: crew enters TCSI (V06N11), NN and ELEV
+        -- (V06N55), TTPI (V06N37). The program calls SELECTMU
+        -- for the gravitational constant, ADVANCE to propagate
+        -- the active vehicle, INTINT to propagate the passive
+        -- vehicle, then CSI/A to iterate the CSI solution.
+        --
+        -- CSI/A uses Newton iteration to find the horizontal
+        -- delta-V at CSI that produces a coelliptic orbit. The
+        -- iteration tracks seven alarm codes (600-606) for
+        -- different convergence failures. LOOPMX limits iterations
+        -- to 16. After convergence, S32/33.1 rotates delta-V
+        -- into reference coordinates.
+        --
+        -- P32 sets AVFLAG (active vehicle = this vehicle).
+        -- P72 clears AVFLAG (passive vehicle = this vehicle).
+        -- The underlying computation is identical.
+}
+
+rule CoellipticSequenceInterBurnCheck {
+    -- Both time intervals (CSI->CDH and CDH->TPI) must exceed
+    -- the minimum to allow for orbit stabilisation and crew
+    -- preparation.
+    when: CoellipticSequenceInitiation(manoeuvre)
+
+    requires:
+        manoeuvre.rendezvous.time_csi_to_cdh < config.min_inter_burn_interval
+            or manoeuvre.rendezvous.time_cdh_to_tpi < config.min_inter_burn_interval
+
+    ensures:
+        manoeuvre.rendezvous.time_csi_to_cdh =
+            max(manoeuvre.rendezvous.time_csi_to_cdh, config.min_inter_burn_interval)
+        manoeuvre.rendezvous.time_cdh_to_tpi =
+            max(manoeuvre.rendezvous.time_cdh_to_tpi, config.min_inter_burn_interval)
+
+    @guidance
+        -- P32/P72E and P32/P72F clamp T1TOT2 and T2TOT3 to a
+        -- minimum of 60MIN (360000 centiseconds = 10 minutes).
+        -- The code loops: DSU 60MIN, BPL to self, meaning it
+        -- subtracts 60 minutes until the remainder is non-negative,
+        -- then uses that remainder. This is effectively a modular
+        -- reduction, not a simple clamp. The result ensures
+        -- both intervals are at least 10 minutes.
+}
+
+-- P33/P73: Constant Delta Height --------------------------------
+
+rule ConstantDeltaHeight {
+    -- Computes the CDH burn to establish a constant altitude
+    -- difference between active and passive vehicles. Depends
+    -- on prior completion of CSI (P32/P72).
+    when: ConstantDeltaHeight(manoeuvre)
+
+    requires:
+        manoeuvre.program = p33_cdh_csm
+            or manoeuvre.program = p73_cdh_lm
+        manoeuvre.phase = awaiting_input
+
+    ensures:
+        manoeuvre.phase = computing_conic
+        let result = ComputeCDH(
+            t_cdh: manoeuvre.burn.tig,
+            t_tpi: manoeuvre.rendezvous.elevation_angle,
+            elevation: manoeuvre.rendezvous.elevation_angle
+        )
+        manoeuvre.burn = result.burn
+        manoeuvre.rendezvous.delta_altitude_cdh = result.delta_altitude
+        manoeuvre.rendezvous.time_cdh_to_tpi = result.time_cdh_to_tpi
+        manoeuvre.thrust_interface.external_delta_v_steering = true
+        manoeuvre.phase = displaying_results
+
+    @guidance
+        -- P33/P73 flow: crew enters TCDH (V06N13). The program
+        -- loads TTPI from TTPIO (saved by P32/P72), calls ADVANCE,
+        -- CDHMVR to compute the CDH delta-V that minimises altitude
+        -- variation, then INTINT3P and ACTIVE/PASSIVE to propagate
+        -- both vehicles forward.
+        --
+        -- S33/34.1 computes the TPI geometry. If the elevation
+        -- angle iteration fails to converge, alarm 611 is raised.
+        -- The crew can proceed (accepting NOMTPI = 0, resetting
+        -- the TPI offset) or recycle to P33/P73A.
+}
+
+-- P34/P74: Transfer Phase Initiation ----------------------------
+
+rule TransferPhaseInitiation {
+    -- Computes the TPI burn for terminal phase of rendezvous.
+    -- Uses the Lambert solver to find the velocity required to
+    -- reach the passive vehicle at the intercept time.
+    when: TransferPhaseInitiation(manoeuvre)
+
+    requires:
+        manoeuvre.program = p34_tpi_csm
+            or manoeuvre.program = p74_tpi_lm
+        manoeuvre.phase = awaiting_input
+
+    ensures:
+        manoeuvre.phase = computing_conic
+        let result = ComputeTPI(
+            t_tpi: manoeuvre.burn.tig,
+            elevation: manoeuvre.rendezvous.elevation_angle,
+            central_angle: manoeuvre.rendezvous.central_angle
+        )
+        manoeuvre.burn = result.burn
+        manoeuvre.orbit = result.orbit
+        manoeuvre.thrust_interface.external_delta_v_steering = false
+        manoeuvre.thrust_interface.target_position = result.target_position
+        manoeuvre.thrust_interface.intercept_time = result.intercept_time
+        manoeuvre.phase = displaying_results
+
+    @guidance
+        -- P34/P74 flow: crew enters TTPI (V06N37), then ELEV
+        -- and CENTANG via DISPLAYE. S33/34.1 iterates to find
+        -- TPI time from elevation angle (or vice versa, controlled
+        -- by ETPIFLAG). TIMETHET computes transfer time from
+        -- the central angle. S34/35.2 calls the Lambert solver
+        -- (INITVEL) for the required velocity.
+        --
+        -- The central angle must not be 170-190 degrees. This
+        -- near-180-degree zone causes the Lambert solver to
+        -- become ill-conditioned. The crew verifies via V06N52.
+        --
+        -- XDELVFLG is cleared, selecting Lambert aimpoint steering.
+}
+
+-- P35/P75: Transfer Phase Midcourse -----------------------------
+
+rule TransferPhaseMidcourse {
+    -- Computes a midcourse correction during the transfer phase.
+    -- Uses the intercept time saved from P34/P74.
+    when: TransferPhaseMidcourse(manoeuvre)
+
+    requires:
+        manoeuvre.program = p35_tpm_csm
+            or manoeuvre.program = p75_tpm_lm
+        manoeuvre.phase = awaiting_input
+
+    ensures:
+        manoeuvre.phase = computing_conic
+        let result = ComputeTPM(
+            intercept_time: manoeuvre.thrust_interface.intercept_time
+        )
+        manoeuvre.burn = result.burn
+        manoeuvre.thrust_interface.external_delta_v_steering = false
+        manoeuvre.thrust_interface.target_position = result.target_position
+        manoeuvre.phase = displaying_results
+
+    @guidance
+        -- P35/P75 uses TPASS4 from P34/P74 as the intercept time.
+        -- The current time becomes TIG. S34/35.1 propagates both
+        -- vehicles, S34/35.2 runs the Lambert solver, S34/35.5
+        -- computes line-of-sight delta-V components (DVLOS).
+        -- XDELVFLG is cleared for Lambert aimpoint steering.
+        --
+        -- Like P34/P74, the transfer angle should be verified
+        -- against the 170-190 degree exclusion zone.
+}
+
+-- P37: Return to Earth ------------------------------------------
+
+rule ReturnToEarthConicSolution {
+    -- Computes an initial conic return-to-Earth trajectory.
+    -- First phase of P37: determines if a satisfactory conic
+    -- solution exists before committing to precision integration.
+    when: ReturnToEarthConicSolution(manoeuvre)
+
+    requires:
+        manoeuvre.program = p37_return_to_earth
+        manoeuvre.phase = awaiting_input
+
+    ensures:
+        manoeuvre.phase = computing_conic
+        let result = ComputeReturnToEarthConic(
+            tig: manoeuvre.burn.tig,
+            desired_delta_v: manoeuvre.rte_params.entry_velocity,
+            desired_gamma: manoeuvre.rte_params.flight_path_angle
+        )
+        manoeuvre.burn = result.burn
+        manoeuvre.rte_params = result.rte_params
+        manoeuvre.phase = displaying_results
+
+    @guidance
+        -- P37 is not restartable. The first instruction is
+        -- PHASCHNG OCT 4 (deactivate all restart groups).
+        -- This is the only manoeuvre program with this property.
+        --
+        -- Crew inputs: TIG (V06N33), reentry angle GAMMAEI and
+        -- desired delta-V RTEDVD (V06N60). Zero inputs for
+        -- GAMMAEI or RTEDVD cause the program to compute optimal
+        -- values.
+        --
+        -- INVC100 integrates the CSM state vector to TIG using
+        -- CSMPREC (precision integration). If the state vector
+        -- is in the Moon's sphere of influence, alarm 612 fires.
+        -- P37 requires the CSM to be outside the lunar sphere.
+        --
+        -- V2T100 iterates to find the conic trajectory satisfying
+        -- the reentry constraints (radius RCON and flight path
+        -- parameter X(T2)). The iteration converges by adjusting
+        -- X(T2) using a secant method (Newton-like, using previous
+        -- and current residuals). Convergence is checked against
+        -- EPC2RTE (radius tolerance) and EPC3RTE (X(T2) tolerance).
+        --
+        -- If the reentry angle is not specified (GAMMAEI = 0),
+        -- the program selects X(T2) = K3 or K4 depending on
+        -- whether R(T1) is above or below K1RTE (a distance
+        -- threshold distinguishing near-Earth from cislunar cases).
+}
+
+rule ReturnToEarthPrecisionSolution {
+    -- Refines the conic solution with numerical integration.
+    -- The crew proceeds from the conic display to request this.
+    when: ReturnToEarthPrecisionSolution(manoeuvre)
+
+    requires:
+        manoeuvre.program = p37_return_to_earth
+        manoeuvre.phase = computing_precision
+
+    ensures:
+        let result = ComputeReturnToEarthPrecision(
+            conic_solution: manoeuvre.burn,
+            rte_params: manoeuvre.rte_params
+        )
+        manoeuvre.burn = result.burn
+        manoeuvre.rte_params = result.rte_params
+        manoeuvre.phase = displaying_results
+
+    @guidance
+        -- PREC100 generates a numerically integrated trajectory
+        -- that satisfies the same reentry constraints as the
+        -- conic solution while meeting the delta-V requirement
+        -- as closely as possible. PHI2 determines whether entry
+        -- is near apogee or perigee of the transfer orbit.
+        --
+        -- The precision solution can raise alarm 605 (excess
+        -- iterations), which causes P37 to recycle from the start.
+}
+
+rule ReturnToEarthAccepted {
+    -- Crew accepts the precision solution. The program computes
+    -- targeting parameters for the thrusting program (P40/P41)
+    -- and adjusts TIG for the selected propulsion system.
+    when: ReturnToEarthAccepted(manoeuvre)
+
+    requires:
+        manoeuvre.program = p37_return_to_earth
+        manoeuvre.phase = accepted
+
+    ensures:
+        let targeting = ComputeRteTargeting(
+            burn: manoeuvre.burn,
+            propulsion: manoeuvre.rte_params.propulsion_option
+        )
+        manoeuvre.thrust_interface = targeting
+        manoeuvre.thrust_interface.external_delta_v_steering = false
+        manoeuvre.thrust_interface.cross_product_steering_constant = 1
+
+    @guidance
+        -- After precision display acceptance, the crew selects
+        -- SPS (OPTION2=1) or RCS (OPTION2=2). TIG is biased
+        -- by the estimated burn duration: TIG = T1 - CT * DTB,
+        -- where DTB is computed from the rocket equation using
+        -- EMDOT (SPS) or MDOTRCS (RCS) mass flow rates and
+        -- VE (exhaust velocity).
+        --
+        -- XDELVFLG and NORMSW are cleared. ECSTEER is set to 1
+        -- (cross-product steering constant). RTARG is the conically
+        -- integrated reentry position vector. TPASS4 is the
+        -- reentry time. FINALFLG is set.
+        --
+        -- The 7.5-degree and 22.5-degree cone tests (MCOS7.5,
+        -- MSIN7.5, MCOS22.5) check whether the transfer trajectory
+        -- passes close to the anti-podal direction. If so, the
+        -- program uses TIMETHET with fixed angles (165 or 210
+        -- degrees) to compute a safe RTARG that avoids the
+        -- Lambert solver singularity.
+}
+
+rule ReturnToEarthSphereOfInfluenceAlarm {
+    -- P37 requires the CSM to be outside the lunar sphere of
+    -- influence at TIG. If not, alarm 612 is raised.
+    when: ReturnToEarthConicSolution(manoeuvre)
+
+    requires:
+        manoeuvre.program = p37_return_to_earth
+
+    let in_lunar_sphere = CheckSphereOfInfluence(tig: manoeuvre.burn.tig)
+
+    requires: in_lunar_sphere = true
+
+    ensures:
+        manoeuvre.alarm_code = config.rte_sphere_of_influence_alarm
+        manoeuvre.phase = failed
+
+    @guidance
+        -- INVC100 checks P(T1) (the sphere-of-influence flag
+        -- from CSMPREC). Non-zero means the state vector is in
+        -- the Moon's sphere, triggering INVC107 -> RTEALRM.
+        -- The crew sees alarm 612 and P37 recycles from the top.
+}
+
+-- P70: DPS Abort ------------------------------------------------
+
+rule DpsAbort {
+    -- LM abort using the descent propulsion system. Computes
+    -- an abort delta-V from the current state.
+    when: DpsAbort(manoeuvre)
+
+    requires:
+        manoeuvre.program = p70_dps_abort
+        manoeuvre.vehicle = lm
+
+    ensures:
+        manoeuvre.phase = computing_conic
+        let result = ComputeDpsAbort()
+        manoeuvre.burn = result.burn
+        manoeuvre.phase = displaying_results
+
+    @guidance
+        -- P70 is the LM companion to P37. It computes a DPS
+        -- (descent engine) abort burn. In Comanche055 (the CM
+        -- program), P70 code exists but is only relevant when
+        -- the CM is computing on behalf of the LM. The actual
+        -- LM abort programs are in Luminary099.
+}
+
+-- Crew display and iteration cycle ------------------------------
+
+rule CrewAcceptsBurnParameters {
+    -- After results are displayed, the crew can accept (proceed),
+    -- reject (terminate to GOTOPOOH) or request recomputation
+    -- (recycle with new inputs).
+    when: CrewAcceptsBurnParameters(manoeuvre, response)
+
+    requires: manoeuvre.phase = displaying_results
+
+    ensures:
+        if response = proceed_response:
+            if manoeuvre.final_flag:
+                manoeuvre.phase = accepted
+            else:
+                manoeuvre.final_flag = true
+                manoeuvre.phase = computing_precision
+        if response = enter_response:
+            manoeuvre.phase = awaiting_input
+
+    @guidance
+        -- The display cycle is managed by VN1645: it displays
+        -- TTOGO and +MGA, handles the PROCEED/RECYCLE/TERMINATE
+        -- responses. On first proceed, FINALFLG is set and the
+        -- computation reruns (precision pass if applicable).
+        -- On second proceed (FINALFLG already set), the burn
+        -- parameters are accepted and stored for the thrusting
+        -- program.
+        --
+        -- GOTOPOOH (terminate) exits to idle. This is available
+        -- at every display point and is not modelled as a rule
+        -- because it simply abandons the computation.
+}
+
+-- TIME_OF_FREE_FALL subroutines ---------------------------------
+
+rule TimeOfFreeFall {
+    -- Computes the time for a spacecraft to travel from its
+    -- current position to a specified terminal radius along
+    -- the current conic trajectory.
+    when: TimeOfFreeFall(position, velocity, mu, terminal_radius)
+
+    ensures:
+        let result = ComputeTimeOfFreeFall(
+            position: position,
+            velocity: velocity,
+            mu: mu,
+            terminal_radius: terminal_radius
+        )
+
+    @guidance
+        -- TFF/CONIC computes the conic parameters: semi-latus
+        -- rectum (LCP), reciprocal semi-major axis (ALFA), and
+        -- RMAG from the state vector and 1/SQRT(MU).
+        --
+        -- ALFA > 0 for elliptic orbits, 0 for parabolic, < 0
+        -- for hyperbolic. The sign determines the time-of-flight
+        -- equations used.
+        --
+        -- The TFF routines work in either Earth or Moon centred
+        -- coordinates. They never know which origin applies; the
+        -- caller supplies RONE, VONE and 1/SQRT(MU) at the
+        -- appropriate scale. Earth positions are scaled 2^29 m,
+        -- Moon positions 2^27 m.
+        --
+        -- CALC/TFF and CALC/TPER assume the terminal radius is
+        -- less than the present radius. This restriction could
+        -- be removed with a 15-word code change but was not
+        -- deemed necessary for Apollo.
+        --
+        -- Index registers X1 (-NR, normalisation count of RMAG)
+        -- and X2 (-NA, normalisation count of SQRT(|ALFA|)) are
+        -- established in TFF/CONIC and must be preserved between
+        -- calls to subsequent TFF subroutines.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant P37NotRestartable {
+    -- P37 disables all restart groups on entry. No other
+    -- manoeuvre program does this.
+    for m in ManoeuvreStates:
+        m.program = p37_return_to_earth
+            implies m.phase != awaiting_input or m.alarm_code = null
+}
+
+-- P37 requires extralunar position: P37 can only execute when
+-- the CSM state vector is outside the lunar sphere of influence.
+-- This is checked at the start of the conic computation, not as
+-- a precondition to program selection.
+
+-- Rendezvous program sequencing: P33/P73 depends on prior
+-- completion of P32/P72 (uses TTPIO). P34/P74 follows P33/P73
+-- in the nominal sequence. P35/P75 depends on P34/P74 (uses
+-- TPASS4). These dependencies are enforced by data flow, not
+-- by explicit program sequencing checks.
+
+-- Transfer angle exclusion zone: the Lambert solver becomes
+-- ill-conditioned when the transfer angle approaches 180 degrees.
+-- P34/P74 and P35/P75 compute the central angle for crew
+-- verification via V06N52. The crew must verify the angle is not
+-- within 170-190 degrees. The AGC does not enforce this
+-- constraint automatically.
+
+invariant MinimumInterBurnInterval {
+    -- Both time intervals in the CSI/CDH sequence must be at
+    -- least the configured minimum (10 minutes).
+    for m in ManoeuvreStates:
+        (m.program = p32_csi_csm or m.program = p72_csi_lm)
+            and m.phase = displaying_results
+            implies m.rendezvous.time_csi_to_cdh >= config.min_inter_burn_interval
+                and m.rendezvous.time_cdh_to_tpi >= config.min_inter_burn_interval
+}
+
+invariant MinimumPericenterAltitude {
+    -- Post-burn pericenter must exceed the safety limit for the
+    -- relevant central body.
+    for m in ManoeuvreStates:
+        m.phase = displaying_results and m.orbit != null
+            implies m.orbit.periapsis_altitude >= config.min_pericenter_lunar
+                or m.orbit.periapsis_altitude >= config.min_pericenter_earth
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Black box functions used in rules:
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeBurnFromExternalDeltaV    -- see: Comanche055/P30-P37.agc (S30.1)
+    -- Integrates state vector to TIG via THISPREC, rotates
+    -- delta-V from local vertical to reference coordinates
+    -- via LOMAT, computes delta-V magnitude, apogee and perigee.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputePostBurnOrbit    -- see: Comanche055/P30-P37.agc (S30.1)
+    -- Calls PERIAPO1 with post-burn velocity to determine
+    -- the resulting orbit's apoapsis and periapsis altitudes.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeCSI    -- see: Comanche055/P32-P33_P72-P73.agc (CSI/A)
+    -- Newton iteration for the coelliptic sequence initiation
+    -- delta-V. Iterates up to LOOPMX (16) times, tracking
+    -- convergence via EPSILN1 (0.1 fps tolerance). Uses
+    -- ADVANCE, INTINT, PASSIVE subroutines for vehicle
+    -- propagation.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeCDH    -- see: Comanche055/P32-P33_P72-P73.agc (CDHMVR)
+    -- Computes the constant delta height manoeuvre using
+    -- CDHMVR to find the delta-V that minimises altitude
+    -- variation between active and passive vehicle orbits.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeTPI    -- see: Comanche055/P34-35_P74-75.agc (S33/34.1, S34/35.2)
+    -- Iterates to find TPI time from elevation angle (or
+    -- vice versa). Calls TIMETHET for transfer time and
+    -- INITVEL (Lambert solver) for the required velocity.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeTPM    -- see: Comanche055/P34-35_P74-75.agc (S34/35.1, S34/35.2)
+    -- Midcourse correction using saved intercept time from
+    -- P34/P74. Same Lambert solver path as TPI.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeReturnToEarthConic    -- see: Comanche055/P37_P70.agc (V2T100, INVC100)
+    -- Conic return-to-Earth computation. Iterates on X(T2)
+    -- using secant method to satisfy reentry radius and
+    -- flight path angle constraints.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeReturnToEarthPrecision    -- see: Comanche055/P37_P70.agc (PREC100)
+    -- Precision (numerically integrated) refinement of the
+    -- conic RTE solution.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeRteTargeting    -- see: Comanche055/P37_P70.agc (P37G-P37W)
+    -- Final targeting computation: biases TIG for propulsion
+    -- system, computes RTARG (avoiding Lambert singularity
+    -- via 7.5/22.5 degree cone tests), stores parameters
+    -- for P40/P41.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeDpsAbort    -- see: Comanche055/P37_P70.agc
+    -- DPS abort burn computation for the LM.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.CheckSphereOfInfluence    -- see: Comanche055/P37_P70.agc (INVC100)
+    -- Checks P(T1) flag from precision integration to
+    -- determine if the CSM is inside the lunar sphere
+    -- of influence.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreState.ComputeTimeOfFreeFall    -- see: Comanche055/TIME_OF_FREE_FALL.agc (TFFCONIC, CALCTFF, CALCTPER)
+    -- Computes conic parameters (semi-latus rectum, semi-major
+    -- axis, eccentricity) and time of flight to a terminal
+    -- radius. Used by P37's RTEDISP for landing site computation
+    -- and by the rendezvous programs for orbit timing.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved: P37 non-restartability is intentional
+--
+-- P37 explicitly disables restart protection at entry with
+-- TC PHASCHNG / OCT 4 and the comment "P37 IS NOT RESTARTABLE"
+-- (Comanche055/P37_P70.agc line 113). The entire computation
+-- (conic iteration up to 600+ loops, optional precision refinement,
+-- Lambert targeting) runs unprotected. P70 (LM DPS abort) follows
+-- the same pattern, clearing groups 1, 3, 4 and 6.
+--
+-- This is a deliberate design decision, likely to save code space.
+-- A GOJAM during P37 loses all computation; the crew must manually
+-- re-enter V37E37E and all input data. The vulnerability window
+-- spans the entire multi-second computation.
+--
+-- Mission-level implication: during Apollo 13, a restart during P37
+-- would have forced recomputation of the return trajectory. The
+-- mission relied on ground-computed parameters to minimise onboard
+-- P37 usage during the crisis.
+
+open question "The CSI/A iteration uses seven distinct alarm codes (600-606) for different failure modes. The source comments do not clearly document which alarm corresponds to which failure. A mapping between CSIALRM values and the specific convergence failure they indicate would clarify the alarm handling logic."
+
+open question "P34/P74's transfer angle exclusion zone (170-190 degrees) is only verified by crew procedure, not enforced by the software. If the crew proceeds with a near-180-degree transfer angle, the Lambert solver may produce inaccurate or divergent results. Should the spec model this as a soft constraint or document the expected degradation?"

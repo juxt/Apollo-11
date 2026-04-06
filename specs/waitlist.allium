@@ -1,0 +1,689 @@
+-- allium: 3
+-- Apollo Guidance Computer — Waitlist subsystem
+-- Time-driven task scheduler using T3 hardware timer
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    waitlist: Waitlist
+    longcall_state: LongCallState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum AgcVariant { comanche055_cm | luminary099_lm }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value TaskEntry {
+    address: Integer
+    bankset: Integer
+
+    @guidance
+        -- A 2CADR: full address (GENADR in first word, BBCON in
+        -- second). Together they identify a task entry point with
+        -- complete bank context. TWIDDLE constructs the BBCON from
+        -- the caller's current banks, saving one word in the
+        -- calling sequence.
+}
+
+value DeltaTime {
+    centiseconds: Integer
+
+    @guidance
+        -- Single-precision delta time in centiseconds (0.01s units).
+        -- Valid range 1..16250, giving a maximum delay of 162.5
+        -- seconds. Zero or negative values trigger alarm 1204.
+}
+
+-- allium-ignore allium.definition.unused
+value LongDeltaTime {
+    centiseconds_hi: Integer
+    centiseconds_lo: Integer
+
+    @guidance
+        -- Double-precision delta time for LONGCALL. The pair
+        -- (centiseconds_hi, centiseconds_lo) represents a value
+        -- that may exceed the 16250 cs single-precision limit.
+        -- LONGCALL iteratively subtracts BIT14 (8192 cs, ~81.92s)
+        -- until the remainder fits in a single WAITLIST call.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- allium-ignore allium.entity.unused
+entity Task {
+    -- A scheduled task: a short routine that runs in interrupt
+    -- context and must end with TC TASKOVER.
+    position: Integer
+    entry: TaskEntry
+    delta_from_predecessor: Integer?
+
+    -- Position 0 is the next task to fire (tracked by TIME3).
+    -- Positions 1..8 are held in LST1/LST2.
+    is_first: position = 0
+
+    invariant ValidPosition {
+        position >= 0 and position < config.max_tasks
+    }
+}
+
+entity Waitlist {
+    -- The timed task scheduler, one instance per AGC
+    variant: AgcVariant
+    task_count: Integer
+    ruptagn: Boolean
+
+    -- The RUPTAGN flag: true (+1) when the next task is already
+    -- due at dispatch time, false (-0) otherwise.
+
+    @guidance
+        -- Data structures:
+        -- TIME3: hardware counter, set to 16384 - (T1 - T) where
+        -- T1 is the absolute time of the first task and T is now.
+        -- Counts up; interrupts on overflow.
+        --
+        -- LST1 (8 entries): delta times between consecutive tasks,
+        -- stored as -(T_{n+1} - T_n) + 1. Initialised to NEG1/2
+        -- (~81.91 seconds, the ENDTASK sentinel interval).
+        --
+        -- LST2 (9 entries x 2 words): 2CADRs of tasks. Initialised
+        -- to ENDTASK sentinel address.
+        --
+        -- The encoding is relative: each LST1 entry holds the
+        -- negated delta between adjacent tasks plus 1. The
+        -- insertion scan accumulates these differences using CCS
+        -- to find the correct position.
+}
+
+entity LongCallState {
+    -- Erasable registers used by LONGCALL's iterative subtraction.
+    -- Only one LONGCALL chain can be active at a time.
+    longtime_hi: Integer
+    longtime_lo: Integer
+    longcadr: TaskEntry
+    longexit: Integer
+
+    @guidance
+        -- LONGTIME (double precision): remaining delay, decremented
+        -- by BIT14 (8192 cs) each iteration of LONGCYCL.
+        -- LONGCADR: the real task's 2CADR, dispatched by GETCADR
+        -- when the delay is small enough for a single WAITLIST call.
+        -- LONGEXIT: patched after the first iteration. Initially
+        -- points to the caller's return address; LONGRTRN overwrites
+        -- it with TASKOVER so subsequent iterations exit as tasks.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    max_tasks: Integer = 9
+    max_delta_cs: Integer = 16250
+    min_delta_cs: Integer = 1
+    longcall_step_cs: Integer = 8192
+    sentinel_delta: Integer = -16384
+    alarm_list_overflow: Integer = 1203
+    alarm_bad_delta: Integer = 1204
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Task scheduling -----------------------------------------
+
+rule ScheduleTaskWaitlist {
+    -- WAITLIST entry point. Delta time in A, 2CADR follows inline.
+    -- Must be called under INHINT.
+    when: ScheduleTaskWaitlist(delta, task)
+
+    requires:
+        delta.centiseconds >= config.min_delta_cs
+        delta.centiseconds <= config.max_delta_cs
+
+    ensures:
+        InsertTask(delta: delta, task: task)
+}
+
+rule ScheduleTaskWaitlistBadDelta {
+    when: ScheduleTaskWaitlist(delta, task)
+
+    requires: delta.centiseconds < config.min_delta_cs
+
+    ensures: Bailout(alarm_code: config.alarm_bad_delta)
+
+    @guidance
+        -- CM (Comanche): validated at WAITLIST entry before saving Q.
+        -- EXTEND / BZMF WATLST0- branches to POODOO with alarm 1204.
+        --
+        -- LM (Luminary): validated later at WAIT2 entry after bank
+        -- switch. CA Q / EXTEND / BZMF WAITPOOH branches to POODOO1
+        -- with alarm 1204.
+        --
+        -- Both variants reject zero and negative delta times, but
+        -- the check happens at different points in the call sequence.
+}
+
+rule ScheduleTaskTwiddle {
+    -- TWIDDLE entry point. Same-bank optimisation: delta time in A,
+    -- ADRES (not full 2CADR) follows inline. Constructs BBCON from
+    -- the caller's current bank context, saving one word.
+    when: ScheduleTaskTwiddle(delta, address)
+
+    requires:
+        delta.centiseconds >= config.min_delta_cs
+        delta.centiseconds <= config.max_delta_cs
+
+    ensures:
+        let task = TaskEntry(address: address, bankset: caller_bankset())
+        InsertTask(delta: delta, task: task)
+
+    @guidance
+        -- TWIDDLE reads ADRES from the word after TC, constructs
+        -- a full 2CADR by reading the caller's BBANK for the BBCON,
+        -- then falls through to WAITLIST.
+}
+
+-- Task self-rescheduling ----------------------------------
+
+rule RescheduleFixdelay {
+    -- FIXDELAY: called from within a running task. Reads delta time
+    -- from the word after TC FIXDELAY (at caller+1), increments Q
+    -- past it. Schedules a new task at that address, then ends the
+    -- current task via TASKOVER.
+    when: RescheduleFixdelay(caller_address)
+
+    ensures:
+        let delta = read_inline_delta(caller_address)
+        let task = TaskEntry(address: caller_address + 2, bankset: current_bankset())
+        InsertTask(delta: delta, task: task)
+        TaskOver()
+
+    @guidance
+        -- The calling pattern is:
+        --   TC FIXDELAY
+        --   DEC <centiseconds>
+        --   ... (task code continues here on next invocation)
+        --
+        -- FIXDELAY reads the DEC value, advances Q past it, and
+        -- uses the advanced Q as the new task's entry address.
+        -- The current task ends immediately after scheduling.
+}
+
+rule RescheduleVardelay {
+    -- VARDELAY: like FIXDELAY but delta time arrives in A rather
+    -- than inline. The task address is taken from Q.
+    when: RescheduleVardelay(delta)
+
+    ensures:
+        let task = TaskEntry(address: caller_q(), bankset: current_bankset())
+        InsertTask(delta: delta, task: task)
+        TaskOver()
+
+    @guidance
+        -- Used when the delay is computed at runtime rather than
+        -- known at assembly time. The caller loads the delta into A
+        -- before TC VARDELAY.
+}
+
+-- Long delays ---------------------------------------------
+
+rule ScheduleLongcall {
+    -- LONGCALL: for delays exceeding 162.5 seconds. Takes
+    -- double-precision delta time in A,L and 2CADR inline.
+    when: ScheduleLongcall(delta, task)
+
+    requires:
+        delta.centiseconds_hi >= 0
+        delta.centiseconds_lo >= 0
+
+    ensures:
+        if fits_in_single_precision(delta):
+            ScheduleTaskWaitlist(
+                delta: DeltaTime(centiseconds: to_single_precision(delta)),
+                task: task
+            )
+        else:
+            LongCallState.created(
+                longtime_hi: delta.centiseconds_hi,
+                longtime_lo: delta.centiseconds_lo,
+                longcadr: task,
+                longexit: caller_return()
+            )
+            LongcallIterate()
+
+    @guidance
+        -- LONGCALL stores the delta in LONGTIME and the task 2CADR
+        -- in LONGCADR, then enters LONGCYCL.
+        --
+        -- Luminary validates for negative delta-time values and
+        -- alarms with 1204 via LONGPOOH. Comanche does NOT validate:
+        -- a negative delta-time to LONGCALL in Comanche silently
+        -- enters LONGCYCL and produces undefined behaviour.
+}
+
+rule LongcallIterate {
+    -- LONGCYCL: subtracts BIT14 (8192 cs, ~81.92 seconds) from
+    -- LONGTIME each iteration. When the remainder fits in single
+    -- precision, adds BIT14 back and calls WAITLIST with GETCADR.
+    when: LongcallIterate()
+
+    ensures:
+        let remaining_hi = longcall_state.longtime_hi - config.longcall_step_cs
+        if remaining_hi < 0:
+            let final_delta = longcall_state.longtime_lo + config.longcall_step_cs
+            ScheduleTaskWaitlist(
+                delta: DeltaTime(centiseconds: final_delta),
+                task: TaskEntry(address: getcadr_address(), bankset: getcadr_bankset())
+            )
+        else:
+            longcall_state.longtime_hi = remaining_hi
+            ScheduleTaskWaitlist(
+                delta: DeltaTime(centiseconds: config.longcall_step_cs),
+                task: longcycl_task()
+            )
+
+    @guidance
+        -- LONGRTRN patches LONGEXIT to point to TASKOVER after the
+        -- first iteration. The first exit returns to the original
+        -- caller; subsequent iterations exit as tasks via TASKOVER.
+        --
+        -- GETCADR loads LONGCADR and dispatches to the real task
+        -- via DTCB with full superbank context.
+        --
+        -- The comment at Comanche line 525 "CAN'T GET HERE" marks
+        -- the +0 branch of CCS LONGTIME+1 in LONGCYCL. This branch
+        -- would require LONGTIME+1 to be exactly +0 after subtracting
+        -- BIT14, which would mean LONGTIME+1 was exactly BIT14 before
+        -- the DAS. The comment is likely correct but the reasoning
+        -- depends on DAS not producing a +0 residual from carry
+        -- propagation.
+}
+
+rule LongcallBadDeltaLuminary {
+    -- Luminary-only: validates long delta-time for negative values.
+    when: ScheduleLongcall(delta, task)
+
+    requires:
+        waitlist.variant = luminary099_lm
+        delta.centiseconds_hi < 0
+
+    ensures: Bailout(alarm_code: config.alarm_bad_delta)
+
+    @guidance
+        -- CCS/BZMF -> LONGPOOH -> alarm 1204.
+        -- Comanche lacks this guard entirely.
+}
+
+-- Task insertion algorithm --------------------------------
+
+rule InsertTaskBeforeFirst {
+    -- WAIT2 path: new task goes before the current first task.
+    -- TD - T1 + 1 <= 0.
+    when: InsertTask(delta, task)
+
+    requires: new_task_precedes_first(delta)
+
+    ensures:
+        ShiftTasksDown(from_position: 0)
+        update_time3(delta)
+        task_inserted_at(task, position: 0)
+        waitlist.task_count = waitlist.task_count + 1
+
+    @guidance
+        -- The new task becomes first. TIME3 is updated directly to
+        -- 1.0 - (TD - T). Q is zeroed. Falls through to WTLST4
+        -- for the shift cascade.
+        --
+        -- Overflow detection: CS TIME3 / AD BIT8 / CCS A. BIT8 =
+        -- OCT 200. If 200 - C(TIME3) is positive, TIME3 has already
+        -- overflowed (passed through zero). The following four
+        -- instructions produce TD - T1 + 1 in either case.
+}
+
+rule InsertTaskAfterFirst {
+    -- WAIT2 path: new task goes after the current first task.
+    -- TD - T1 + 1 > 0. Enters WTLST5 unrolled scan.
+    when: InsertTask(delta, task)
+
+    requires: not new_task_precedes_first(delta)
+
+    ensures:
+        let position = find_insertion_position(delta)
+        ShiftTasksDown(from_position: position)
+        update_lst1_splice(delta, position)
+        task_inserted_at(task, position: position)
+        waitlist.task_count = waitlist.task_count + 1
+
+    @guidance
+        -- WTLST5: unrolled scan over 8 positions. For each position
+        -- n = 1..8, accumulates LST1 deltas and computes
+        -- TD - T_{n+1} + 1. When the result goes non-positive, the
+        -- insertion point is between T_n and T_{n+1}.
+        --
+        -- WTLST2 (splice): updates LST1[n-1] to -(TD - T_n) + 1
+        -- (delta from predecessor to new task). The old delta is
+        -- split: the remainder -(T_{n+1} - TD) + 1 becomes the new
+        -- value shifted down.
+        --
+        -- The unrolled WTLST5 scan is the same pattern as the
+        -- Executive's EJSCAN: an unrolled loop on a machine with
+        -- no loop hardware. Eight iterations of CCS/AD/TCF/AD ONE/
+        -- TC WTLST2/OCT.
+}
+
+rule InsertTaskListFull {
+    -- WTABORT: the shift cascade displaced a non-ENDTASK entry
+    -- from the bottom of the list. All 9 positions are occupied.
+    when: ShiftTasksDown(from_position)
+
+    requires: waitlist.task_count >= config.max_tasks
+
+    ensures: Bailout(alarm_code: config.alarm_list_overflow)
+
+    @guidance
+        -- CM (Comanche): TC BAILOUT / OCT 1203 directly.
+        -- LM (Luminary): TC FILLED saves WAITEXIT registers first,
+        -- then TC BAILOUT1 / OCT 01203. Luminary's approach
+        -- preserves more debug context.
+}
+
+-- T3RUPT dispatch -----------------------------------------
+
+rule T3RuptDispatch {
+    -- T3RUPT: hardware timer interrupt fires when TIME3 overflows.
+    -- The first task is extracted and dispatched.
+    when: T3Interrupt()
+
+    ensures:
+        let dispatched_task = extract_first_task()
+        ShiftTasksUp()
+        if next_task_already_due():
+            waitlist.ruptagn = true
+        else:
+            waitlist.ruptagn = false
+        DispatchTask(task: dispatched_task)
+        waitlist.task_count = waitlist.task_count - 1
+
+    @guidance
+        -- Sequence:
+        -- 1. Save bank context (BANKRUPT, QRUPT).
+        -- 2. Shift LST1 up: cascade XCH from LST1+7 down to LST1+0,
+        --    inserting NEG1/2 at the bottom (sentinel delta).
+        -- 3. Displaced LST1+0 value (delta to next task) is added to
+        --    TIME3 via AD POSMAX / ADS TIME3.
+        -- 4. RUPTAGN mechanism: if ADS TIME3 overflows (next task
+        --    already due), TS overflow-skip sets RUPTAGN = +1. If no
+        --    overflow, CS ZERO / TS RUPTAGN sets RUPTAGN = -0. The TS
+        --    overflow-skip is a non-obvious idiom: TS normally stores
+        --    A and continues; on overflow it skips one instruction.
+        --    The code arranges the skip to land on the +1 store and
+        --    the non-skip to land on the -0 store.
+        -- 5. Shift LST2 up: cascade DCS ENDTASK / DXCH from LST2+16
+        --    down to LST2+0, inserting ENDTASK sentinel at the bottom.
+        -- 6. Dispatch extracted task via DTCB with superbank context.
+        --
+        -- The XCH cascade through LST1 and DXCH cascade through LST2
+        -- are array shifts implemented with register exchanges. Each
+        -- XCH swaps A with the memory location, effectively sliding
+        -- all entries up by one position while the old first entry
+        -- ends up in A.
+}
+
+-- Task completion -----------------------------------------
+
+rule TaskOverNoMoreDue {
+    -- TASKOVER when RUPTAGN = -0: no more tasks due this interrupt.
+    -- Restore context and RESUME.
+    when: TaskOver()
+
+    requires: waitlist.ruptagn = false
+
+    ensures:
+        RestoreInterruptContext()
+
+    @guidance
+        -- CCS RUPTAGN: -0 falls to the fourth branch. Restores
+        -- QRUPT -> Q, BANKRUPT -> BBANK, ARUPT -> A,L, then
+        -- RELINT and hardware RESUME.
+}
+
+rule TaskOverAnotherDue {
+    -- TASKOVER when RUPTAGN = +1: another task was due at the same
+    -- time or earlier. Re-enter T3RUPT2 to dispatch it.
+    when: TaskOver()
+
+    requires: waitlist.ruptagn = true
+
+    ensures:
+        T3RuptContinue()
+
+    @guidance
+        -- CCS RUPTAGN: +1 is positive, first branch taken. Switches
+        -- banks and re-enters T3RUPT2 to extract and dispatch the
+        -- next task without returning from the interrupt.
+}
+
+-- ENDTASK sentinel ----------------------------------------
+
+rule EndtaskSentinelFires {
+    -- ENDTASK/SVCT3: the sentinel task at the bottom of LST2.
+    -- Not idle — performs periodic IMU drift compensation.
+    when: DispatchTask(task: endtask_sentinel())
+
+    ensures:
+        if drift_flag_clear() and imu_not_in_use():
+            ScheduleJob(
+                entry_point: nbdonly_address(),
+                priority: 35
+            )
+        else:
+            ScheduleTaskWaitlist(
+                delta: DeltaTime(centiseconds: 500),
+                task: svct3_task()
+            )
+
+    @guidance
+        -- ENDTASK is placed in fixed-fixed memory (reachable by
+        -- address alone without banking). It is a -2CADR pointing
+        -- to SVCT3.
+        --
+        -- SVCT3 checks FLAGWRD2 (drift flag) via CCS. If FLAGWRD2
+        -- is non-zero (drift flag set), goes to TASKOVER (does
+        -- nothing this cycle). If FLAGWRD2 is zero (drift flag
+        -- clear), proceeds to check IMUCADR. If IMUCADR is non-zero
+        -- (someone else is using the IMU), delays 500 cs and
+        -- re-checks (SVCT3X). Only if both conditions are met
+        -- (drift flag clear AND IMU free) does it schedule NBDONLY
+        -- at PRIO35 for gyro drift compensation.
+        --
+        -- Note: the drift flag logic is inverted from what the name
+        -- might suggest. NBDONLY runs when the flag is CLEAR, not
+        -- when it is set. FLAGWRD2 being non-zero inhibits drift
+        -- compensation, acting as a "don't compensate now" flag
+        -- rather than a "needs compensation" flag.
+        --
+        -- The sentinel interval (NEG1/2 in LST1) corresponds to
+        -- ~81.91 seconds. This ties the Waitlist to the IMU
+        -- subsystem: even when no application tasks are scheduled,
+        -- the sentinel periodically services gyro drift.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant TaskCountBound {
+    waitlist.task_count >= 0 and waitlist.task_count <= config.max_tasks
+}
+
+invariant DeltaTimePositive {
+    -- All scheduled delta times are within the valid single-precision range.
+    for task in Tasks:
+        task.delta_from_predecessor != null implies
+            task.delta_from_predecessor >= 1
+}
+
+-- Prose invariants (not expressible as entity-state assertions)
+--
+-- TasksRunInInterruptContext: tasks execute during T3RUPT handling.
+-- They must not use Executive services (JOBSLEEP, CHANG1, CHANG2) or
+-- perform any operation that assumes job-level cooperative scheduling.
+-- Tasks may call NOVAC or FINDVAC to create jobs, but the task itself
+-- is not a job.
+--
+-- WaitlistCalledUnderInhint: WAITLIST, TWIDDLE and all insertion paths
+-- must be called with interrupts inhibited (INHINT). The insertion
+-- algorithm manipulates TIME3 and LST1/LST2 non-atomically; an
+-- intervening T3RUPT during insertion would corrupt the list.
+--
+-- EndtaskInFixedFixed: the ENDTASK sentinel address must reside in
+-- fixed-fixed memory (addresses reachable without bank switching).
+-- This allows the sentinel to be distinguished by address alone when
+-- checking whether the displaced bottom entry is a real task or the
+-- sentinel.
+
+------------------------------------------------------------
+-- Implementation notes
+------------------------------------------------------------
+
+-- Unrolled scan pattern
+--
+-- WTLST5's eight iterations follow the same pattern as EJSCAN
+-- in the Executive: CCS/AD/TCF/AD ONE/TC WTLST2/OCT. Each
+-- iteration accumulates the running sum of deltas and tests
+-- whether the new task belongs before the next entry. On a
+-- machine with no index registers (beyond INDEX) and no loop
+-- hardware, unrolling is the only option for a fixed-size scan.
+
+-- XCH/DXCH cascade as array shift
+--
+-- WTLST4 shifts LST1 entries down using a cascade of XCH
+-- instructions, and LST2 entries down using DXCH. Each exchange
+-- swaps the accumulator with a memory location, so after
+-- visiting each position in sequence, all entries have moved
+-- one slot and the old bottom entry is in the accumulator
+-- (checked against ENDTASK for overflow). This is the natural
+-- idiom for array manipulation on the AGC, which has no
+-- block-move instructions.
+
+-- TS overflow-skip in RUPTAGN
+--
+-- The RUPTAGN flag-set exploits the TS instruction's overflow
+-- behaviour. Normally TS stores A to memory and continues to
+-- the next instruction (PC+1). If A has overflowed, TS stores
+-- the sign of the overflow (±1), corrects A, and skips to PC+2.
+-- The T3RUPT code is:
+--
+--   ADS  TIME3     # add delta to TIME3; A has overflow if next task due
+--   TS   RUPTAGN   # (a) no overflow: store result, continue to CS ZERO
+--                   # (b) overflow: store ±1, skip to second TS RUPTAGN
+--   CS   ZERO      # only reached without overflow; A = -0
+--   TS   RUPTAGN   # reached in both cases: stores -0 (normal) or ±1 (due)
+--
+-- Without overflow: RUPTAGN = -0 (no more tasks due).
+-- With overflow: the CS ZERO is skipped, so the second TS stores
+-- the ±1 from the first TS. RUPTAGN = +1 (another task is due).
+-- The original comment ("SETS RUPTAGN TO +1 ON OVERFLOW") does
+-- not explain this mechanism.
+
+-- Relationship to the Executive
+--
+-- Tasks and jobs are complementary scheduling mechanisms:
+-- - Jobs (Executive): cooperative, priority-scheduled, run in normal
+--   context, may use the interpreter and VAC areas.
+-- - Tasks (Waitlist): time-driven, run in interrupt context (T3RUPT),
+--   must be short and end with TC TASKOVER.
+--
+-- Tasks can create jobs (via TC NOVAC or TC FINDVAC within the task
+-- body — note that these are called under INHINT which is already
+-- the case during T3RUPT handling). Jobs can schedule tasks (via TC
+-- WAITLIST). But tasks cannot sleep, yield, or change priority — those
+-- are Executive operations that assume job-level context. A task that
+-- attempts JOBSLEEP or CHANG1 would corrupt the executive state.
+--
+-- The ENDTASK sentinel demonstrates this coupling: a Waitlist task
+-- (SVCT3) calls NOVAC to create an Executive job (NBDONLY).
+
+-- LONGCALL single-instance constraint
+--
+-- LONGCALL uses one set of erasable registers: LONGTIME (2 words),
+-- LONGEXIT, LONGCADR (2 words). There is no provision for
+-- concurrent LONGCALL chains. If a second LONGCALL is issued
+-- while the first is still iterating through LONGCYCL, the
+-- second will overwrite the first's state. Whether the mission
+-- programs ever require concurrent long-delay scheduling is an
+-- open question (see below).
+
+-- LONGEXIT patching
+--
+-- On the first iteration, LONGEXIT points to the caller's return
+-- address so that LONGCALL returns normally. LONGRTRN overwrites
+-- LONGEXIT with the address of TASKOVER before scheduling the
+-- next LONGCYCL iteration. Subsequent iterations therefore end
+-- as tasks (via TASKOVER) rather than returning to a caller that
+-- has long since moved on.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+open question "LONGCALL uses a single set of erasable registers (LONGTIME, LONGEXIT, LONGCADR). Only one LONGCALL chain can be active at a time. If mission programs need multiple concurrent delays exceeding 162.5 seconds, they must serialize through LONGCALL or use an alternative mechanism. Do any mission programs actually issue concurrent long-delay scheduling? If so, the single-register constraint is a latent bug."
+
+open question "The +0 branch of CCS LONGTIME+1 in LONGCYCL is marked 'CAN'T GET HERE' (Comanche line 525, Luminary line 527). This branch would fire if LONGTIME+1 were exactly +0 after DAS subtracts BIT14 (8192). In ones' complement, if LONGTIME+1 was exactly 8192 before the DAS and no borrow propagated from the high word, the result is +0 and this branch IS reached. Either there is an implicit constraint on LONGTIME values that prevents this (e.g. callers never pass a delta whose low word is exactly BIT14), or the NOOP serves as a benign no-op if the branch is taken (the code falls through to TCF +1 which continues to the next CCS). If the latter, the comment is misleading rather than wrong — the NOOP is a soft landing, not an unreachable trap."
+
+open question "Comanche's LONGCALL does not validate for negative delta-time values. Luminary does (CCS/BZMF -> LONGPOOH -> alarm 1204). A negative delta-time to LONGCALL in Comanche would silently enter LONGCYCL and produce undefined behaviour. Is this an intentional omission (callers are trusted) or a bug fixed in Luminary?"
+
+------------------------------------------------------------
+-- Deferred specifications
+------------------------------------------------------------
+
+-- Black box functions used in rules:
+-- find_insertion_position(delta): WTLST5 unrolled scan over LST1
+-- new_task_precedes_first(delta): overflow-aware comparison of TD - T1 + 1
+-- update_time3(delta): sets TIME3 to 1.0 - (TD - T)
+-- update_lst1_splice(delta, position): WTLST2 delta splitting
+-- extract_first_task(): reads LST2+0 and returns the 2CADR
+-- next_task_already_due(): checks whether ADS TIME3 overflowed
+-- caller_bankset(): reads BBANK for TWIDDLE's 2CADR construction
+-- fits_in_single_precision(delta): tests whether high word is zero
+-- to_single_precision(delta): extracts low word as single-precision delta
+-- imu_drift_flag_set(): tests DTEFTEFG for IMU gyro drift compensation
+-- endtask_sentinel(): the ENDTASK 2CADR in fixed-fixed memory
+-- svct3_task(): the SVCT3 re-check task entry
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Waitlist.find_insertion_position    -- see: Comanche055/WAITLIST.agc, Luminary099/WAITLIST.agc
+    -- WTLST5: unrolled scan accumulating LST1 deltas. Eight
+    -- iterations of CCS/AD/TCF/AD ONE/TC WTLST2/OCT. Returns
+    -- the position where the new task's delta fits between
+    -- consecutive entries.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Waitlist.new_task_precedes_first    -- see: Comanche055/WAITLIST.agc, Luminary099/WAITLIST.agc
+    -- Overflow-aware computation of TD - T1 + 1. Uses CS TIME3 /
+    -- AD BIT8 / CCS A to detect whether TIME3 has already
+    -- overflowed (passed through zero). Produces the correct
+    -- result in either case.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Waitlist.extract_first_task    -- see: Comanche055/WAITLIST.agc, Luminary099/WAITLIST.agc
+    -- Reads LST2+0,+1 (the 2CADR of the first task) during the
+    -- DXCH cascade in T3RUPT. The displaced value ends up in A,L
+    -- for dispatch via DTCB.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Waitlist.next_task_already_due    -- see: Comanche055/WAITLIST.agc, Luminary099/WAITLIST.agc
+    -- After adding the next LST1 delta to TIME3 via ADS, checks
+    -- whether the addition overflowed. Overflow means the next
+    -- task's absolute time has already passed.

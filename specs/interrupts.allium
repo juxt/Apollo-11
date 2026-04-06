@@ -1,0 +1,567 @@
+-- allium: 3
+-- Apollo Guidance Computer — Interrupt system and T4RUPT program
+-- Hardware interrupt dispatch, periodic I/O state machine, DSKY display driver, IMU monitoring
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    interrupt_system: InterruptSystem
+    t4_state: T4State
+    display_state: DisplayState
+    imu_monitor: ImuMonitorState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum AgcVariant { comanche055_cm | luminary099_lm }
+
+enum InterruptSlot {
+    gojam
+    | t6rupt
+    | t5rupt
+    | t3rupt
+    | t4rupt
+    | keyrupt1
+    | keyrupt2
+    | uprupt
+    | downrupt
+    | radar_rupt
+    | rupt10
+}
+
+enum DispatchMode {
+    direct          -- TCF to fixed handler address
+    | indirect      -- DCA from pointer word, DTCB
+    | inline_check  -- CM T5RUPT: test TIME5 against threshold before dispatch
+    | unused        -- Slot not serviced, immediate RESUME
+}
+
+-- allium-ignore allium.definition.unused
+enum T4Subsystem {
+    display_output
+    | optics_test
+    | optics_monitor
+    | imu_monitor
+    | rcs_monitor
+    | radar_auto_check
+    | dap_service
+    | idle_slot
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value InterruptVectorEntry {
+    slot: InterruptSlot
+    cm_handler: String
+    lm_handler: String
+    dispatch_mode_cm: DispatchMode
+    dispatch_mode_lm: DispatchMode
+    purpose: String
+
+    @guidance
+        -- Each non-GOJAM vector slot occupies 4 words at a fixed address
+        -- starting at 4004 (slot 1). The standard entry sequence is:
+        -- DXCH ARUPT (save A,L to interrupt save area), load bank context
+        -- via CAF BBCONxx / XCH BBANK, then TCF to handler.
+        --
+        -- Indirect slots (T5, T6) replace the bank load with:
+        -- EXTEND / DCA T6LOC (or T5ADR) / DTCB, jumping through a
+        -- pointer that the scheduling code maintains.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity InterruptSystem {
+    variant: AgcVariant
+    interrupts_inhibited: Boolean
+    active_interrupt: InterruptSlot?
+    vectors: Set<InterruptVectorEntry>
+
+    @guidance
+        -- The interrupt vector table occupies fixed address 4000-4053
+        -- (octal). GOJAM at 4000 is the hardware restart entry.
+        -- The AGC services at most one interrupt at a time. Nested
+        -- interrupts are not supported; INHINT is implicit on entry.
+}
+
+entity T4State {
+    variant: AgcVariant
+    dsruptsw: Integer
+    ruptreg1: Integer
+    -- DSRUPTSW cycles 7 → 6 → 5 → 4 → 3 → 2 → 1 → 0 → 7 ...
+    -- Between 0 and the reload to 7, QUIKDSP runs (DSRUPTSW negative)
+
+    invariant DsruptswRange {
+        dsruptsw >= -1 and dsruptsw <= 7
+    }
+
+    @guidance
+        -- CCS DSRUPTSW decrements the counter each cycle. Three branches:
+        -- positive (> 0): normal T4 cycle via NORMT4+1.
+        -- +0: reload counter to 7, start new cycle via NORMT4.
+        -- Negative: quick display update via QUIKDSP.
+}
+
+entity DisplayState {
+    dsptab: Set<Integer>
+    nout: Integer
+    pending_update: Boolean
+
+    @guidance
+        -- DSPTAB is an 11-entry table of display relay words. Each
+        -- entry encodes a relay word and relay number, written to
+        -- OUT0 channel during DSPOUT. DSPTAB+11D (the 12th word) is
+        -- a flag checked first to determine if any updates are pending.
+}
+
+entity ImuMonitorState {
+    imodes30: Integer
+    imodes33: Integer
+    gimbal_lock_detected: Boolean
+    @guidance
+        -- IMODES30 and IMODES33 hold saved copies of channels 30 and 33.
+        -- Each T4 cycle, IMUMON compares current channel values against
+        -- these saved copies to detect state transitions. This is polling
+        -- at 120ms intervals, not true interrupt-driven monitoring.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    interrupt_vector_base: Integer = 4000
+    interrupt_slot_width: Integer = 4
+    t4_period_ms: Integer = 120
+    quick_display_period_ms: Integer = 20
+    dsruptsw_max: Integer = 7
+    dsptab_entries: Integer = 11
+    gimbal_lock_threshold_degrees: Integer = 70
+    t4_jump_table_size: Integer = 8
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Interrupt dispatch -----------------------------------------
+
+rule GojamRestart {
+    -- Slot 0: hardware restart. INHINT, load GOPROG bank, jump to
+    -- restart routine. Executes on power-up and hardware faults.
+    when: InterruptFired(slot: gojam)
+
+    ensures:
+        interrupt_system.interrupts_inhibited = true
+        GoprogEntry()
+
+    @guidance
+        -- The first instruction at address 4000 is INHINT, ensuring
+        -- no other interrupt can fire during restart initialisation.
+        -- This is the same GOPROG entry for both CM and LM.
+}
+
+rule InterruptDispatchDirect {
+    -- Standard interrupt dispatch: save A,L via DXCH ARUPT,
+    -- load handler bank context, TCF to handler.
+    when: InterruptFired(slot)
+
+    requires:
+        slot != gojam
+        interrupt_system.active_interrupt = null
+
+    ensures:
+        interrupt_system.active_interrupt = slot
+        interrupt_system.interrupts_inhibited = true
+        InterruptHandlerEntry(slot: slot)
+}
+
+rule InterruptResume {
+    -- RESUME instruction: restore A,L from ARUPT, re-enable
+    -- interrupts, return to interrupted code.
+    when: InterruptComplete(slot)
+
+    requires: interrupt_system.active_interrupt = slot
+
+    ensures:
+        interrupt_system.active_interrupt = null
+        interrupt_system.interrupts_inhibited = false
+}
+
+-- CM T5RUPT inline check ------------------------------------
+
+rule T5RuptCmSpurious {
+    -- CM T5RUPT has inline timing: CS TIME5 / AD .5SEC. If the
+    -- result is non-positive, the interrupt is spurious and
+    -- immediately resumes without dispatching.
+    when: InterruptFired(slot: t5rupt)
+
+    requires:
+        interrupt_system.variant = comanche055_cm
+        not T5TimerReady()
+
+    ensures: InterruptComplete(slot: t5rupt)
+
+    @guidance
+        -- The CM T5 timer is shared between autopilot functions with
+        -- different periods. This inline check prevents spurious
+        -- dispatch when TIME5 has not reached the .5SEC threshold.
+        -- BZMF NOQBRSM branches to RESUME if the result is non-positive.
+}
+
+rule T5RuptCmDispatch {
+    -- CM T5RUPT: timer ready, dispatch via T5LOC indirect pointer.
+    when: InterruptFired(slot: t5rupt)
+
+    requires:
+        interrupt_system.variant = comanche055_cm
+        T5TimerReady()
+
+    ensures: InterruptHandlerEntry(slot: t5rupt)
+}
+
+rule T5RuptLmDispatch {
+    -- LM T5RUPT: fully indirect via T5ADR 2CADR, no inline check.
+    when: InterruptFired(slot: t5rupt)
+
+    requires: interrupt_system.variant = luminary099_lm
+
+    ensures: InterruptHandlerEntry(slot: t5rupt)
+}
+
+-- RUPT10 CM/LM difference -----------------------------------
+
+rule Rupt10CmUnused {
+    -- CM RUPT10: unused, immediately resumes (TCF RESUME+3 = NOQBRSM).
+    when: InterruptFired(slot: rupt10)
+
+    requires: interrupt_system.variant = comanche055_cm
+
+    ensures: InterruptComplete(slot: rupt10)
+}
+
+rule Rupt10LmPitfall {
+    -- LM RUPT10: dispatches to PITFALL for landing guidance during descent.
+    when: InterruptFired(slot: rupt10)
+
+    requires: interrupt_system.variant = luminary099_lm
+
+    ensures: InterruptHandlerEntry(slot: rupt10)
+
+    @guidance
+        -- PITFALL is part of the descent guidance system. This slot
+        -- is one of the most significant architectural differences
+        -- between the CM and LM software.
+}
+
+-- T4RUPT entry and state machine ----------------------------
+
+rule T4RuptEntry {
+    -- T4RUPT fires every 120ms. Save BANKRUPT, QRUPT, then
+    -- branch on DSRUPTSW.
+    when: InterruptFired(slot: t4rupt)
+
+    ensures:
+        T4CycleBranch(dsruptsw: t4_state.dsruptsw)
+}
+
+rule T4NormalCycle {
+    -- DSRUPTSW positive: decrement counter, dispatch via T4JUMP table.
+    when: T4CycleBranch(dsruptsw)
+
+    requires: dsruptsw > 0
+
+    ensures:
+        t4_state.dsruptsw = dsruptsw - 1
+        T4SubsystemDispatch(
+            subsystem: t4_jump_table_lookup(t4_state.ruptreg1)
+        )
+        TimerReload(timer: `TIME4`, period: config.t4_period_ms)
+}
+
+rule T4CycleReload {
+    -- DSRUPTSW is +0: reload to 7, start new cycle via NORMT4.
+    when: T4CycleBranch(dsruptsw)
+
+    requires: dsruptsw = 0
+
+    ensures:
+        t4_state.dsruptsw = config.dsruptsw_max
+        T4SubsystemDispatch(
+            subsystem: t4_jump_table_lookup(t4_state.ruptreg1)
+        )
+        TimerReload(timer: `TIME4`, period: config.t4_period_ms)
+}
+
+rule T4QuickDisplay {
+    -- DSRUPTSW negative: quick display update (QUIKDSP) without
+    -- the full monitoring suite.
+    when: T4CycleBranch(dsruptsw)
+
+    requires: dsruptsw < 0
+
+    ensures:
+        QuickDisplayUpdate()
+        TimerReload(timer: `TIME4`, period: config.quick_display_period_ms)
+}
+
+-- T4 jump table (CM) ----------------------------------------
+
+rule T4JumpTableCm {
+    -- CM table: optics test, optics monitor, IMU monitor, idle (×2 cycle)
+    when: T4SubsystemDispatch(subsystem)
+
+    requires: t4_state.variant = comanche055_cm
+
+    ensures:
+        if subsystem = optics_test: OpticsTest()
+        if subsystem = optics_monitor: OpticsMonitor()
+        if subsystem = imu_monitor: ImuMonitorCycle()
+        if subsystem = idle_slot: InterruptComplete(slot: t4rupt)
+
+    @guidance
+        -- CM T4JUMP table (8 entries, indexed by RUPTREG1):
+        -- 0: OPTTEST, 1: OPTMON, 2: IMUMON, 3: RESUME,
+        -- 4: OPTTEST, 5: OPTMON, 6: IMUMON, 7: RESUME.
+        -- CDRVE (display output) runs before T4JUMP on every T4
+        -- cycle, not as a table entry. It is the code that falls
+        -- through to T4JUMP after writing relay words to OUT0.
+}
+
+-- T4 jump table (LM) ----------------------------------------
+
+rule T4JumpTableLm {
+    -- LM table: RCS monitor, radar check, IMU monitor, DAP service (×2 cycle)
+    when: T4SubsystemDispatch(subsystem)
+
+    requires: t4_state.variant = luminary099_lm
+
+    ensures:
+        if subsystem = rcs_monitor: RcsMonitor()
+        if subsystem = radar_auto_check: RadarAutoCheck()
+        if subsystem = imu_monitor: ImuMonitorCycle()
+        if subsystem = dap_service: DapT4Service()
+
+    @guidance
+        -- LM T4JUMP table (8 entries, indexed by RUPTREG1):
+        -- 0: RCSMONIT, 1: RRAUTCHK, 2: IMUMON, 3: DAPT4S,
+        -- 4: RCSMONIT, 5: RRAUTCHK, 6: IMUMON, 7: DAPT4S.
+        -- CDRVE (display output) runs before T4JUMP on every T4
+        -- cycle, not as a table entry. CM optics slots replaced
+        -- with RCS, radar and DAP.
+}
+
+-- DSKY display driver ----------------------------------------
+
+rule DisplayDrive {
+    -- CDRVE / DSPOUT: scan DSPTAB for entries needing output,
+    -- write relay words to OUT0 channel. Runs on every normal
+    -- T4 cycle before T4JUMP dispatches the subsystem routine.
+    when: T4NormalCycleEntry()
+
+    ensures:
+        DisplayScan()
+        T4SubsystemDispatch(
+            subsystem: t4_jump_table_lookup(t4_state.ruptreg1)
+        )
+
+    @guidance
+        -- CDRVE runs first on every normal T4 cycle. It checks
+        -- DSPTAB+11D for pending updates. DSPOUT scans all 11
+        -- DSPTAB entries. Each entry with a pending bit set is
+        -- encoded via RELTAB into a relay word + relay number
+        -- and written to OUT0 channel. NOUT tracks remaining words.
+        -- After display output, falls through to T4JUMP which
+        -- dispatches the appropriate subsystem routine.
+}
+
+rule DisplayScan {
+    -- DSPOUT processes each DSPTAB entry that has changed.
+    when: DisplayScan()
+
+    requires: display_state.pending_update = true
+
+    ensures:
+        for entry in display_state.dsptab:
+            if entry_needs_output(entry):
+                RelayWrite(relay: reltab_encode(entry))
+        display_state.pending_update = false
+}
+
+rule DisplayScanNoop {
+    when: DisplayScan()
+
+    requires: display_state.pending_update = false
+
+    ensures: ImuMonitorCycle()
+}
+
+-- IMU monitoring (IMUMON) -----------------------------------
+
+rule ImuMonitorCycle {
+    -- Polls channel 30, compares against saved IMODES30 for changes.
+    -- Detects IMU fail, CDU fail, cage, operate state transitions.
+    when: ImuMonitorCycle()
+
+    let current_ch30 = ReadChannel(channel: 30)
+
+    ensures:
+        if current_ch30 != imu_monitor.imodes30:
+            ImuStateChange(
+                previous: imu_monitor.imodes30,
+                current: current_ch30
+            )
+            imu_monitor.imodes30 = current_ch30
+
+    @guidance
+        -- Despite running inside an interrupt handler, IMU state changes
+        -- are detected by polling, not by dedicated hardware interrupts.
+        -- Rapid transients shorter than 120ms could be missed. Changes
+        -- are processed sequentially: failure detection, turn-on
+        -- sequencing, caging.
+}
+
+rule GimbalLockDetection {
+    -- Checks CDUZ against ±70° threshold. Manages GIMBAL LOCK lamp.
+    when: ImuStateChange(previous, current)
+
+    let cduz_angle = ReadCduZ()
+
+    ensures:
+        if abs(cduz_angle) >= config.gimbal_lock_threshold_degrees:
+            imu_monitor.gimbal_lock_detected = true
+            SetLamp(lamp: `GIMBAL_LOCK`)
+        else:
+            imu_monitor.gimbal_lock_detected = false
+            ClearLamp(lamp: `GIMBAL_LOCK`)
+}
+
+-- Channel 33 monitoring (C33TEST) ---------------------------
+
+rule Channel33Monitor {
+    -- Monitors channel 33 for optics/IMU mode changes.
+    when: Channel33MonitorCycle()
+
+    let current_ch33 = ReadChannel(channel: 33)
+
+    ensures:
+        if current_ch33 != imu_monitor.imodes33:
+            Channel33StateChange(
+                previous: imu_monitor.imodes33,
+                current: current_ch33
+            )
+            imu_monitor.imodes33 = current_ch33
+
+    @guidance
+        -- CM: detects optics CDU mode changes.
+        -- LM: detects AOT (Alignment Optical Telescope) mode changes.
+        -- Both: detects IMU mode changes. Bit changes are processed
+        -- sequentially.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- GOJAM occupies the first interrupt slot (slot 0) at the vector base
+-- address 4000. This is fixed by hardware and not configurable.
+
+invariant SingleActiveInterrupt {
+    -- The AGC services at most one interrupt at a time.
+    -- Nested interrupts are not supported.
+    interrupt_system.active_interrupt != null
+        implies interrupt_system.interrupts_inhibited = true
+}
+
+invariant T4JumpTableSize {
+    -- The T4 jump table always has 8 entries, regardless of vehicle variant.
+    t4_jump_table_size() = config.t4_jump_table_size
+}
+
+invariant DsruptswBound {
+    t4_state.dsruptsw >= -1 and t4_state.dsruptsw <= config.dsruptsw_max
+}
+
+------------------------------------------------------------
+-- Implementation notes
+------------------------------------------------------------
+
+-- DSRUPTSW cycling mechanism
+--
+-- CCS DSRUPTSW produces three branches:
+-- Positive (> 0): value decremented by 1, falls through to NORMT4+1.
+-- +0: CCS of +0 loads -0 into A, falls to the third branch (NORMT4),
+-- which reloads DSRUPTSW to 7.
+-- -0 / Negative: after reload, CCS of -0 loads +0 into A, falls to the
+-- fourth branch (QUIKDSP). This means one quick display cycle runs
+-- between each counter reload.
+--
+-- The sequence is: 7,6,5,4,3,2,1,0,[reload to 7, QUIKDSP],7,6,...
+-- yielding 8 normal cycles plus interleaved quick display updates.
+
+-- RELTAB relay encoding
+--
+-- RELTAB is a lookup table mapping DSPTAB indices to relay codes.
+-- Each entry packs the relay word code in the upper 4 bits and the
+-- relay number in the lower 5 bits. The DSKY hardware decodes these
+-- to drive the electroluminescent segment panels. The encoding is
+-- fixed by hardware and not configurable.
+
+-- Interrupt save area (APTS)
+--
+-- On interrupt entry, DXCH ARUPT saves the accumulator and L register
+-- to the ARUPT/LRUPT pair. BANKRUPT/QRUPT save bank context and
+-- return address. These are restored by the RESUME instruction.
+-- Each interrupt has a dedicated save area; there is no stack.
+
+-- CM/LM T4 table as architectural boundary
+--
+-- The T4 jump table is one of the most visible CM/LM differences.
+-- CM dedicates two slots to optics (OPTTEST, OPTMON) and two to
+-- RESUME (idle), reflecting the CM's sextant/telescope. LM replaces
+-- these with RCS monitoring (RCSMONIT), rendezvous radar auto-check
+-- (RRAUTCHK), and DAP servicing (DAPT4S) reflecting the LM's
+-- descent/ascent needs. IMUMON appears at indices 2 and 6 in both
+-- tables. Display handling (CDRVE) runs before T4JUMP on every
+-- normal cycle and is not a table entry.
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred InterruptSystem.t4_jump_table_lookup    -- see: Comanche055/T4RUPT_PROGRAM.agc, Luminary099/T4RUPT_PROGRAM.agc
+    -- Indexes into the T4JUMP table using RUPTREG1. Returns the
+    -- T4Subsystem for the current cycle position.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred InterruptSystem.entry_needs_output    -- see: Comanche055/T4RUPT_PROGRAM.agc, Luminary099/T4RUPT_PROGRAM.agc
+    -- Checks whether a DSPTAB entry has its pending bit set,
+    -- indicating it needs to be written to the display hardware.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred InterruptSystem.reltab_encode    -- see: Comanche055/T4RUPT_PROGRAM.agc, Luminary099/T4RUPT_PROGRAM.agc
+    -- Encodes a DSPTAB index into a relay word via the RELTAB
+    -- lookup table. Returns a RelayWord value.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred InterruptSystem.t4_jump_table_size    -- see: Comanche055/T4RUPT_PROGRAM.agc, Luminary099/T4RUPT_PROGRAM.agc
+    -- Returns the number of entries in the T4 jump table.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+open question "Can T4RUPT be missed if a higher-priority interrupt runs long? The AGC has no interrupt nesting, so a long-running T3RUPT (waitlist) or T6RUPT (DAP) could delay T4RUPT servicing. If TIME4 overflows before the pending T4RUPT is serviced, the interrupt is not lost (it remains pending) but the effective T4 period stretches. What is the actual worst-case T4 latency, and does it affect display update or IMU monitoring responsiveness?"
+
+open question "Display update latency under load: the DSKY is driven by T4RUPT polling at 120ms with 20ms quick display intervals. Under heavy interrupt load (multiple T3/T5/T6 interrupts), T4RUPT servicing is delayed. What is the worst-case latency from a DSPTAB write to the corresponding relay word appearing on OUT0? The 8-cycle T4 rotation means a given subsystem slot runs at most every 960ms (8 × 120ms). Combined with interrupt latency, display updates could lag by over a second."
+
+open question "IMU polling at 120ms means transient channel 30 glitches shorter than one T4 period are invisible to the monitoring code. Is this acceptable for all IMU failure modes, or are there failure conditions where sub-120ms detection is safety-critical? The hardware IMU fail signal has its own discrete path, but the software response (alarm, mode change) depends on IMUMON catching the transition."

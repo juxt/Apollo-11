@@ -1,0 +1,554 @@
+-- allium: 3
+-- Apollo Guidance Computer — Navigation and orbital mechanics
+-- Conic trajectory subroutines, orbital integration (Encke's method)
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    integration_state: IntegrationState
+    conic_workspace: ConicWorkspace
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum CentralBody { earth | moon }
+
+enum ConicType { circular | elliptic | parabolic | hyperbolic | rectilinear }
+
+enum IntegrationMode { precision | conic }
+
+enum Vehicle { csm | lm }
+
+-- allium-ignore allium.definition.unused
+enum IntegrationEntry { csmprec | lemprec | csmconic | lemconic | integrvs | integrv }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value StateVector {
+    position: List<Decimal>
+    velocity: List<Decimal>
+    time: Decimal
+    central_body: CentralBody
+
+    @guidance
+        -- 42 registers per state vector in the AGC erasable.
+        -- Position is 3 DP words, velocity is 3 DP words, time
+        -- is 1 DP word. Remaining registers hold computational
+        -- intermediates (conic elements, rectification data,
+        -- deviation from reference conic).
+        --
+        -- Scaling differs by central body. Earth positions are
+        -- scaled 2^29 metres, Moon positions 2^27 metres. The
+        -- MUTABLE provides the gravitational parameter MU and
+        -- the sphere-of-influence radius for the active body.
+}
+
+-- allium-ignore allium.definition.unused
+value ConicElements {
+    semi_latus_rectum: Decimal
+    eccentricity: Decimal
+    conic_type: ConicType
+
+    @guidance
+        -- Derived from position and velocity via the vis-viva
+        -- equation. The conic type is determined by eccentricity:
+        -- 0 = circular, 0 < e < 1 = elliptic, 1 = parabolic,
+        -- e > 1 = hyperbolic. Rectilinear is the degenerate case
+        -- where the semi-latus rectum approaches zero.
+}
+
+value Perturbations {
+    oblateness_j2: Boolean
+    oblateness_j22: Boolean
+    third_body_gravity: Boolean
+    solar_radiation_pressure: Boolean
+
+    @guidance
+        -- Which perturbation terms are active depends on the
+        -- central body and the MIDCOURSE flag.
+        --
+        -- Earth orbit: J2 oblateness, Moon and Sun as third bodies.
+        -- Lunar orbit: J2 and J22 oblateness (the J22 sectoral
+        -- harmonic is significant for the Moon), Earth and Sun
+        -- as third bodies.
+        -- Solar radiation pressure is optional in both regimes.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity IntegrationState {
+    -- Serialisation lock and working state for orbital integration
+    locked: Boolean
+    active_vehicle: Vehicle?
+    mode: IntegrationMode?
+
+    -- The three state vector sets
+    csm_state: StateVector
+    lm_state: StateVector
+    working_state: StateVector?
+
+    -- W-matrix integration (state transition matrix for nav filter)
+    w_matrix_enabled: Boolean
+
+    -- Encke's method: deviation from reference conic
+    rectification_needed: Boolean
+
+    -- Target termination conditions
+    target_time: Decimal?
+    target_radius: Decimal?
+
+    -- Perturbation selection
+    perturbations: Perturbations?
+    midcourse: Boolean
+
+    @guidance
+        -- The working state vector overlays a shared erasable region.
+        -- During integration, the permanent state vector for the
+        -- active vehicle is copied into the working set, integrated,
+        -- and copied back on completion.
+        --
+        -- RFINAL: when target_radius is set, integration terminates
+        -- when the vehicle reaches that radius rather than (or in
+        -- addition to) reaching the target time. Used by landing
+        -- guidance to find the time of closest approach.
+}
+
+entity ConicWorkspace {
+    -- Shared erasable storage for conic subroutines
+    in_use: Boolean
+    mu: Decimal
+    central_body: CentralBody
+
+    @guidance
+        -- All conic subroutines (KEPLER, LAMBERT, TIME-THETA,
+        -- general CONIC) share this erasable workspace. They
+        -- cannot interrupt each other. The caller must guarantee
+        -- mutual exclusion — there is no lock mechanism. This is
+        -- a structural constraint of the code, not a runtime check.
+        --
+        -- MU (gravitational parameter) is loaded from the MUTABLE
+        -- for the active central body before entry.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    state_vector_registers: Integer = 42
+    -- No explicit iteration count limit in the source code.
+    -- Convergence relies on Laguerre's method robustness.
+    rectification_threshold: Decimal = 0.01
+    sphere_of_influence_earth: Decimal = 64373.76
+    sphere_of_influence_moon: Decimal = 10000.0
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Conic subroutines ----------------------------------------
+
+rule KeplerPropagate {
+    -- Given initial state vector and transfer time, compute the
+    -- updated state vector along a Keplerian (two-body) trajectory.
+    when: KeplerPropagate(state, delta_time)
+
+    requires:
+        not conic_workspace.in_use
+        state.central_body != null
+
+    ensures:
+        let result = kepler_iteration(state, delta_time)
+        KeplerResult(state: result)
+
+    @guidance
+        -- Works for all conic types. Uses iterative solution of
+        -- Kepler's equation (or the universal variable formulation).
+        --
+        -- If delta_time is negative, propagates backward along the
+        -- trajectory. If delta_time exceeds one orbital period (for
+        -- elliptic orbits), reduces modulo the period first. The
+        -- Mod 2 Aug 1968 change extended this to handle backdating
+        -- by more than one full period.
+        --
+        -- The iteration uses Laguerre's method for convergence.
+        -- Runs entirely in interpretive code.
+}
+
+rule LambertSolve {
+    -- Given initial position, final position, and transfer angle,
+    -- compute the trajectory connecting them.
+    when: LambertSolve(initial_position, final_position, transfer_angle)
+
+    requires: not conic_workspace.in_use
+
+    ensures:
+        let trajectory = lambert_iteration(initial_position, final_position, transfer_angle)
+        LambertResult(trajectory: trajectory)
+
+    @guidance
+        -- TIME-THETA subroutine. Used for rendezvous targeting:
+        -- given where you are, where you want to be, and the
+        -- geometry of the transfer, determine the required
+        -- velocity.
+}
+
+rule ConicPropagate {
+    -- General conic trajectory propagation.
+    when: ConicPropagate(state, delta_time)
+
+    requires: not conic_workspace.in_use
+
+    ensures:
+        let result = conic_propagation(state, delta_time)
+        ConicResult(state: result)
+}
+
+rule TimeOfFlight {
+    -- Compute transfer time for a given conic trajectory.
+    when: TimeOfFlight(state, target_position)
+
+    requires: not conic_workspace.in_use
+
+    ensures:
+        let time = compute_time_of_flight(state, target_position)
+        TimeOfFlightResult(time: time)
+}
+
+-- Integration stalling protocol ----------------------------
+
+rule IntegrationStall {
+    -- INTSTALL: if integration is already running, put the
+    -- caller to sleep until it completes.
+    when: RequestIntegration(vehicle, mode)
+
+    requires: integration_state.locked = true
+
+    ensures: JobSleep(job: current_job)
+
+    @guidance
+        -- Analogous to IMUSTALL for the IMU. The caller is put
+        -- to sleep via JOBSLEEP and will be woken when the current
+        -- integration completes and releases the lock.
+}
+
+rule IntegrationAcquire {
+    -- Caller acquires the integration lock.
+    when: RequestIntegration(vehicle, mode)
+
+    requires: integration_state.locked = false
+
+    ensures:
+        integration_state.locked = true
+        integration_state.active_vehicle = vehicle
+        integration_state.mode = mode
+}
+
+-- Integration entry points ---------------------------------
+
+rule InitialiseCsmPrec {
+    -- CSMPREC: precision integration of CSM state vector.
+    when: InitialiseIntegration(entry: csmprec)
+
+    ensures:
+        RequestIntegration(vehicle: csm, mode: precision)
+        integration_state.working_state = integration_state.csm_state
+        integration_state.perturbations = select_perturbations(integration_state.csm_state.central_body, integration_state.midcourse)
+}
+
+rule InitialiseLemPrec {
+    -- LEMPREC: precision integration of LM state vector.
+    when: InitialiseIntegration(entry: lemprec)
+
+    ensures:
+        RequestIntegration(vehicle: lm, mode: precision)
+        integration_state.working_state = integration_state.lm_state
+        integration_state.perturbations = select_perturbations(integration_state.lm_state.central_body, integration_state.midcourse)
+}
+
+rule InitialiseCsmConic {
+    -- CSMCONIC: conic (Kepler) propagation of CSM state vector.
+    when: InitialiseIntegration(entry: csmconic)
+
+    ensures:
+        RequestIntegration(vehicle: csm, mode: conic)
+        integration_state.working_state = integration_state.csm_state
+}
+
+rule InitialiseLemConic {
+    -- LEMCONIC: conic propagation of LM state vector.
+    when: InitialiseIntegration(entry: lemconic)
+
+    ensures:
+        RequestIntegration(vehicle: lm, mode: conic)
+        integration_state.working_state = integration_state.lm_state
+}
+
+rule InitialiseIntegrvs {
+    -- INTEGRVS: caller supplies state vector and flags directly.
+    when: InitialiseIntegration(entry: integrvs, supplied_state, supplied_mode)
+
+    ensures:
+        RequestIntegration(vehicle: supplied_state.vehicle, mode: supplied_mode)
+        integration_state.working_state = supplied_state
+}
+
+rule InitialiseIntegrv {
+    -- INTEGRV: caller sets flags, uses permanent state vector.
+    when: InitialiseIntegration(entry: integrv, vehicle: v, mode: m)
+
+    ensures:
+        RequestIntegration(vehicle: v, mode: m)
+        if v = csm:
+            integration_state.working_state = integration_state.csm_state
+        else:
+            integration_state.working_state = integration_state.lm_state
+}
+
+-- Precision integration (Encke's method) -------------------
+
+rule PrecisionIntegrate {
+    -- Advance the working state vector to the target time using
+    -- Encke's method: integrate the deviation from a reference
+    -- conic, accumulating perturbation effects.
+    when: PrecisionIntegrate(target_time)
+
+    requires:
+        integration_state.locked = true
+        integration_state.mode = precision
+
+    ensures:
+        integration_state.working_state.time = target_time
+        if integration_state.w_matrix_enabled:
+            WMatrixUpdated()
+        IntegrationComplete()
+
+    @guidance
+        -- Encke's method is more accurate than direct integration
+        -- for near-conic orbits because the integrated quantity
+        -- (deviation from a reference Kepler orbit) is small,
+        -- reducing truncation and roundoff errors.
+        --
+        -- The integration step size is adaptive, limited by the
+        -- perturbation magnitudes. Each step:
+        -- 1. Propagate the reference conic (KEPLER subroutine)
+        -- 2. Compute perturbation accelerations at the current point
+        -- 3. Integrate the deviation using a Nystrom method
+        -- 4. Check if rectification is needed
+        --
+        -- When target_radius is set (RFINAL), integration also
+        -- checks whether the vehicle has crossed the target radius
+        -- and interpolates to find the crossing time.
+}
+
+rule ConicIntegrate {
+    -- Advance the working state vector using Kepler propagation
+    -- only (no perturbations).
+    when: ConicIntegrate(target_time)
+
+    requires:
+        integration_state.locked = true
+        integration_state.mode = conic
+
+    ensures:
+        integration_state.working_state.time = target_time
+        IntegrationComplete()
+}
+
+-- Rectification -------------------------------------------
+
+rule Rectify {
+    -- When the deviation from the reference conic grows too large,
+    -- absorb it back into a new reference conic.
+    when: integration_state: IntegrationState.rectification_needed becomes true
+
+    requires: integration_state.locked = true
+
+    ensures:
+        integration_state.rectification_needed = false
+
+    @guidance
+        -- Rectification resets the reference conic to the current
+        -- actual trajectory (reference + deviation). The deviation
+        -- is zeroed and a new reference conic is computed from the
+        -- current position and velocity.
+        --
+        -- Too frequent rectification wastes computation. Too
+        -- infrequent rectification loses precision as the deviation
+        -- grows and higher-order terms become significant. The
+        -- threshold is governed by config.rectification_threshold.
+}
+
+-- Sphere of influence transition ---------------------------
+
+rule SphereOfInfluenceTransition {
+    -- When the vehicle crosses from one body's sphere of influence
+    -- to another, change the reference body and rescale.
+    when: SphereOfInfluenceTransition(state, new_body)
+
+    requires:
+        integration_state.locked = true
+        state.central_body != new_body
+
+    ensures:
+        integration_state.working_state.central_body = new_body
+        Rectify()
+
+    @guidance
+        -- The sphere of influence boundary is checked at each
+        -- integration step. When the distance to the secondary
+        -- body drops below the sphere of influence radius, the
+        -- reference frame switches.
+        --
+        -- This involves:
+        -- 1. Transform position/velocity to the new body's frame
+        -- 2. Change MU to the new body's gravitational parameter
+        -- 3. Rescale all quantities (Earth and Moon scaling differ)
+        -- 4. Force rectification (new reference conic in new frame)
+        -- 5. Update perturbation selection (different third bodies)
+}
+
+-- Integration completion -----------------------------------
+
+rule IntegrationComplete {
+    -- Copy the working state back to the permanent state vector
+    -- and release the lock.
+    when: IntegrationComplete()
+
+    requires: integration_state.locked = true
+
+    ensures:
+        if integration_state.active_vehicle = csm:
+            integration_state.csm_state = integration_state.working_state
+        else:
+            integration_state.lm_state = integration_state.working_state
+        integration_state.locked = false
+        integration_state.active_vehicle = null
+        integration_state.mode = null
+        integration_state.working_state = null
+
+    @guidance
+        -- On completion, any jobs sleeping on INTSTALL are woken
+        -- via JOBWAKE, allowing the next queued integration to
+        -- proceed.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant SingleIntegration {
+    -- At most one integration runs at a time.
+    integration_state.locked implies integration_state.active_vehicle != null
+}
+
+invariant WorkingStateConsistency {
+    -- Working state exists only when integration is in progress.
+    integration_state.working_state != null implies integration_state.locked
+}
+
+invariant ConicMutualExclusion {
+    -- Conic subroutines share erasable and cannot interrupt each other.
+    -- This is a structural constraint: callers must coordinate.
+    for a in ConicWorkspaces:
+        for b in ConicWorkspaces:
+            a != b implies not (a.in_use and b.in_use)
+}
+
+------------------------------------------------------------
+-- Implementation notes
+------------------------------------------------------------
+
+-- Encke's method rationale
+--
+-- Direct numerical integration of the equations of motion
+-- accumulates error proportional to the total acceleration
+-- (dominated by the central body's gravity). Encke's method
+-- instead integrates the difference between the actual trajectory
+-- and an analytically known reference conic. Since this difference
+-- is small for near-conic orbits, the integration is more accurate
+-- for a given step size. The cost is periodic rectification when
+-- the deviation grows large.
+
+-- Scaling conventions
+--
+-- All position and velocity quantities are scaled relative to the
+-- central body. Earth scaling: position 2^29 metres, velocity
+-- 2^7 m/s. Moon scaling: position 2^27 metres, velocity 2^5 m/s.
+-- The scaling factors are embedded in the MUTABLE constants and
+-- affect all arithmetic. A sphere-of-influence transition requires
+-- rescaling every quantity in the state vector.
+
+-- Mutual exclusion constraint
+--
+-- The conic subroutines (KEPLER, LAMBERT, TIME-THETA, CONIC) share
+-- a common erasable workspace. There is no runtime lock — the code
+-- assumes callers do not overlap. This assumption holds because
+-- the executive is cooperatively scheduled and these subroutines
+-- run within a single interpretive job that does not yield mid-
+-- computation. If a higher-priority job were to call a conic
+-- subroutine while another is in progress, the workspace would be
+-- corrupted. The INTSTALL mechanism protects integration but not
+-- the conic subroutines themselves.
+
+-- RFINAL termination
+--
+-- When RFINAL is set, the integrator checks the vehicle's radius
+-- at each step. If the radius crosses the target value, the
+-- integrator interpolates to find the exact crossing time and
+-- terminates there rather than continuing to the target time.
+-- Used by powered descent guidance (P63/P64) to determine the
+-- time of altitude milestones.
+
+-- CM/LM differences
+--
+-- Integration initialisation uses different permanent state vector
+-- locations (RRECTCSM vs RRECTLEM). The LM on the lunar surface
+-- does not use orbital integration; its position is computed from
+-- the Moon's rotation via planetary inertial orientation subroutines.
+-- The MIDCOURSE flag selects a different perturbation model during
+-- translunar/transearth coast.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+open question "Kepler iteration convergence: the iteration loop in KEPLER has no explicit iteration count limit or timeout. For near-parabolic orbits (eccentricity very close to 1), convergence may be extremely slow. Is the iteration guaranteed to terminate for all physically realisable trajectories the AGC would encounter? The universal variable formulation with Laguerre's method is generally robust, but edge cases near e=1 deserve analysis."
+
+open question "W-matrix overflow: the state transition matrix is 6x6 (or larger with consider parameters), integrated alongside the state vector. With limited DP precision, can the W-matrix elements overflow during long integration arcs? If so, is there a reset or scaling mechanism? The navigation filter (P20 series) depends on the W-matrix being valid."
+
+------------------------------------------------------------
+-- Deferred specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred IntegrationState.kepler_iteration    -- see: Comanche055/CONIC_SUBROUTINES.agc, Luminary099/CONIC_SUBROUTINES.agc
+    -- Universal variable formulation of Kepler's equation.
+    -- Iterates using Laguerre's method until convergence.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred IntegrationState.lambert_iteration    -- see: Comanche055/CONIC_SUBROUTINES.agc, Luminary099/CONIC_SUBROUTINES.agc
+    -- TIME-THETA: solves Lambert's problem given two positions
+    -- and a transfer angle.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred IntegrationState.conic_propagation    -- see: Comanche055/CONIC_SUBROUTINES.agc, Luminary099/CONIC_SUBROUTINES.agc
+    -- General conic trajectory propagation.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred IntegrationState.compute_time_of_flight    -- see: Comanche055/CONIC_SUBROUTINES.agc, Luminary099/CONIC_SUBROUTINES.agc
+    -- Compute the transfer time for a given conic arc.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred IntegrationState.select_perturbations    -- see: Comanche055/ORBITAL_INTEGRATION.agc, Luminary099/ORBITAL_INTEGRATION.agc
+    -- Select active perturbation terms based on central body
+    -- and MIDCOURSE flag.

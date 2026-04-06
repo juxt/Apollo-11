@@ -1,0 +1,859 @@
+-- allium: 3
+-- Apollo Guidance Computer — Alignment, optics and attitude manoeuvre programs
+-- P51/P52/P53 alignment, ANGLFIND, KALCMANU steering, gimbal lock avoidance
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    alignment: AlignmentState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum OrientationMode { preferred | nominal | landing_site | refsmmat }
+
+enum AlignmentPhase {
+    idle
+    | selecting_orientation
+    | computing_gimbal_angles
+    | coarse_aligning
+    | star_sighting
+    | fine_aligning
+    | complete
+}
+
+enum ManoeuvrePhase {
+    idle
+    | computing
+    | steering
+    | stopping
+    | complete
+}
+
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Matrix3x3 {
+    -- 3x3 direction cosine matrix, nine DP components
+    -- Stored as three half-unit row vectors
+    r0: Vector3
+    r1: Vector3
+    r2: Vector3
+}
+
+value Vector3 {
+    x: Decimal
+    y: Decimal
+    z: Decimal
+}
+
+value GimbalAngles {
+    -- Outer, inner, middle gimbal angles
+    -- Stored SP at THETAD, THETAD+1, THETAD+2
+    outer: Integer
+    inner: Integer
+    middle: Integer
+}
+
+value GyroTorqueAngles {
+    -- Angles for X, Y, Z gyro torquing
+    -- Stored DP at OGC, IGC, MGC
+    outer: Decimal
+    inner: Decimal
+    middle: Decimal
+}
+
+value StarPair {
+    star_1: Integer
+    star_2: Integer
+
+    @guidance
+        -- BESTI, BESTJ: single-precision integers holding
+        -- star catalogue numbers times 6.
+}
+
+value BodyRates {
+    roll: Decimal
+    pitch: Decimal
+    yaw: Decimal
+}
+
+value CduIncrements {
+    -- Per-axis CDU angle increments sent to the DAP every 0.1s
+    roll: Integer
+    pitch: Integer
+    yaw: Integer
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity AlignmentState {
+    -- The alignment subsystem, one per AGC
+
+    -- REFSMMAT: the 3x3 matrix relating stable member axes
+    -- to the inertial reference frame. Computed from star
+    -- sightings and used throughout the mission for all
+    -- navigation computations.
+    refsmmat: Matrix3x3?
+    refsmmat_valid: Boolean
+
+    -- Desired stable member orientation (XSMD, YSMD, ZSMD)
+    desired_orientation: Matrix3x3?
+
+    -- Current alignment phase
+    phase: AlignmentPhase
+
+    -- Selected orientation mode for P52
+    orientation_mode: OrientationMode?
+
+    -- Star selection
+    selected_stars: StarPair?
+    stars_available: Boolean
+
+    -- Sighting data (stable member coordinates of observed stars)
+    star_sighting_1: Vector3?
+    star_sighting_2: Vector3?
+    star_index: Integer?
+
+    -- Computed gimbal angles for coarse alignment
+    target_gimbal_angles: GimbalAngles?
+
+    -- Gyro torque angles for fine alignment
+    gyro_torque: GyroTorqueAngles?
+
+    -- Preferred orientation flag (PFRATFLG)
+    preferred_orientation_set: Boolean
+
+    -- Drift compensation active (DRIFTFLG)
+    drift_compensation_active: Boolean
+
+    transitions phase {
+        idle -> selecting_orientation
+        selecting_orientation -> computing_gimbal_angles
+        computing_gimbal_angles -> coarse_aligning
+        coarse_aligning -> star_sighting
+        star_sighting -> fine_aligning
+        fine_aligning -> complete
+        -- Shortcuts for P51 which skips coarse align after initial zero
+        idle -> star_sighting
+        complete -> idle
+        terminal: idle
+    }
+}
+
+entity ManoeuvreProfile {
+    -- A commanded attitude manoeuvre (KALCMANU)
+    phase: ManoeuvrePhase
+
+    -- Initial and final S/C-to-SM matrices
+    initial_matrix: Matrix3x3?
+    final_matrix: Matrix3x3?
+
+    -- Rotation axis and angle
+    rotation_axis: Vector3?
+    rotation_angle: Decimal?
+
+    -- Incremental rotation matrix (DEL)
+    delta_matrix: Matrix3x3?
+
+    -- CDU angle targets
+    commanded_angles: GimbalAngles?
+    current_cdu: GimbalAngles?
+
+    -- Body rates and CDU increments sent to DAP
+    body_rates: BodyRates?
+    cdu_increments: CduIncrements?
+
+    -- Attitude error biases to prevent overshoot
+    biases: BodyRates?
+
+    -- Manoeuvre completion time (TM)
+    completion_time: Integer?
+
+    -- Rate index (selects manoeuvre rate from ARATE table)
+    rate_index: Integer?
+
+    -- HOLDFLAG: negative = auto manoeuvre active,
+    -- +0 = attitude hold, positive = free control
+    hold_flag: Integer
+
+    -- Gimbal lock encountered during this manoeuvre
+    gimbal_lock_detected: Boolean
+
+    transitions phase {
+        idle -> computing
+        computing -> steering
+        steering -> stopping
+        steering -> idle
+        stopping -> complete
+        complete -> idle
+        terminal: idle
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Star selection parameters
+    star_separation_min_degrees: Decimal = 40.0
+    star_separation_max_degrees: Decimal = 66.0
+    star_field_of_view_half_angle_degrees: Decimal = 33.0
+    star_catalogue_size: Integer = 37
+
+    -- Coarse align threshold: difference below which coarse
+    -- align is skipped and only fine align is performed
+    coarse_align_skip_threshold_degrees: Decimal = 1.0
+    coarse_align_near_full_threshold_degrees: Decimal = 359.0
+
+    -- Gimbal lock detection
+    gimbal_lock_threshold_degrees: Decimal = 60.0
+    gimbal_lock_buffer_degrees: Decimal = 2.0
+
+    -- Manoeuvre angle thresholds
+    manoeuvre_min_angle_degrees: Decimal = 0.25
+    manoeuvre_max_angle_degrees: Decimal = 170.0
+
+    -- KALCMANU steering update interval
+    steering_update_interval_cs: Integer = 100
+
+    -- Manoeuvre rates (ARATE table, degrees/sec)
+    rate_low: Decimal = 0.05
+    rate_medium_low: Decimal = 0.2
+    rate_medium: Decimal = 0.5
+    rate_high: Decimal = 2.0
+
+    -- Optics trunnion limits
+    trunnion_limit_degrees: Decimal = 90.0
+    trunnion_warning_degrees: Decimal = 50.0
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- P52: IMU Realignment -----------------------------------------
+
+rule SelectOrientation {
+    -- P52 entry: astronaut selects one of four orientation modes.
+    -- PREFERRED requires PFRATFLG set by a prior program.
+    -- NOMINAL computes from vehicle state at a chosen time.
+    -- LANDING SITE computes from landing site coordinates.
+    -- REFSMMAT corrects the current orientation.
+    when: SelectOrientation(mode)
+
+    requires: alignment.phase = idle
+
+    ensures:
+        alignment.phase = selecting_orientation
+        alignment.orientation_mode = mode
+
+    @guidance
+        -- PROG52 entry. OPTION2 selects the orientation code.
+        -- Clears UPDATFLG and TRACKFLG, checks IMU status via
+        -- R02BOTH, then branches by orientation code.
+}
+
+rule SelectPreferredOrientationNotSet {
+    -- Alarm 215: preferred orientation requested but PFRATFLG not set.
+    when: SelectOrientation(mode)
+
+    requires:
+        mode = preferred
+        not alignment.preferred_orientation_set
+
+    ensures: Alarm(code: `215`)
+
+    @guidance
+        -- P52 checks BIT4 of STATE+2 (PFRATFLG). If clear and
+        -- preferred mode chosen, alarm 215 is flashed.
+}
+
+rule ComputeNominalOrientation {
+    -- S52.3: computes nominal orientation from vehicle state.
+    -- ZSMD = UNIT(-R), YSMD = UNIT(V x R), XSMD = UNIT(YSMD x ZSMD)
+    when: ComputeNominalOrientation(time)
+
+    requires: alignment.phase = selecting_orientation
+
+    ensures:
+        alignment.desired_orientation = compute_nominal_orientation(time)
+        alignment.phase = computing_gimbal_angles
+}
+
+rule ComputeGimbalAnglesForAlignment {
+    -- S52.2: reads vehicle attitude, computes gimbal angles needed
+    -- to orient the stable member to the desired orientation.
+    -- Transforms XSMD/YSMD/ZSMD through REFSMMAT and current NB
+    -- coordinates to produce THETAD angles.
+    when: ComputeGimbalAnglesForAlignment()
+
+    requires: alignment.desired_orientation != null
+
+    ensures:
+        alignment.target_gimbal_angles = compute_gimbal_angles(
+            alignment.desired_orientation,
+            alignment.refsmmat
+        )
+        alignment.phase = computing_gimbal_angles
+
+    @guidance
+        -- S52.2 calls CDUTRIG, CALCSMSC to get current NB vectors,
+        -- then transforms XSMD/YSMD/ZSMD through REFSMMAT into SM
+        -- coordinates. CALCGA produces THETAD, THETAD+1, THETAD+2.
+}
+
+rule CoarseAlignImu {
+    -- CAL53A: performs coarse alignment if any axis differs from
+    -- current CDU angles by more than the skip threshold. If all
+    -- axes are within threshold, skips to fine align directly.
+    when: CoarseAlignImu()
+
+    requires:
+        alignment.target_gimbal_angles != null
+        alignment.phase = computing_gimbal_angles
+
+    ensures:
+        ImuCoarseAlign(angles: alignment.target_gimbal_angles)
+        ImuStall()
+        alignment.phase = coarse_aligning
+
+    @guidance
+        -- CAL53A compares each THETAD axis with the corresponding
+        -- CDUX/Y/Z. If the absolute difference exceeds DEGREE1
+        -- (about 1 degree) and is less than DEG359, IMUCOARS is
+        -- called. Otherwise the axis is skipped. After coarse
+        -- align, IMUFIN20 schedules fine align mode switch with
+        -- IMUSTALL wait.
+}
+
+rule SelectStarPair {
+    -- PICAPAR: automatic star pair selection.
+    -- Computes the shaft axis (SAX), tests each catalogue star for
+    -- occultation by Earth, Sun, or Moon, pairs non-occulted stars,
+    -- checks angular separation (40-66 degrees) and field of view
+    -- (within 33 degrees of SAX), selects pair with maximum separation.
+    when: SelectStarPair()
+
+    requires: alignment.phase = coarse_aligning or alignment.phase = star_sighting
+
+    ensures:
+        if stars_in_field_of_view():
+            alignment.selected_stars = find_best_star_pair()
+            alignment.stars_available = true
+        else:
+            alignment.stars_available = false
+            Alarm(code: `405`)
+
+    @guidance
+        -- PICAPAR reads IMU CDUs, computes vehicle orientation
+        -- relative to inertial space via CALCSMSC. SAX is the
+        -- sextant shaft axis in reference coordinates. Stars are
+        -- tested against CEARTH, CMOON, CSUN for occultation.
+        -- Pairs must have angular separation between COS(66 deg)
+        -- and COS(40 deg), and both must lie within COS(33 deg)
+        -- of SAX. The pair with the largest separation wins.
+}
+
+rule TakeStarSighting {
+    -- R53: sighting mark routine. Calls SXTMARK to collect CDU
+    -- and optics angles at the time of the mark. Mark data is
+    -- stored in a VAC area indexed by MARKSTAT.
+    when: TakeStarSighting(star_index)
+
+    requires: alignment.phase = star_sighting
+
+    ensures:
+        MarkStar(star_index: star_index)
+        alignment.star_index = star_index
+
+    @guidance
+        -- R53 sets R53FLAG, calls SXTMARK with MARKINDX marks
+        -- requested, then OPTSTALL to wait for completion. The
+        -- mark system records CDUY, CDUS, CDUZ, CDUT, CDUX and
+        -- TIME2/TIME1 into the VAC area. MARKSTAT indexes the
+        -- stored data. If no marks were made, R53 retries.
+}
+
+rule ComputeStarLos {
+    -- SXTSM: computes an LOS vector in stable member coordinates
+    -- from the OCDU and ICDU mark data. SXTNB converts optics
+    -- angles to NB coordinates, NBSM transforms to SM.
+    when: ComputeStarLos(star_index)
+
+    ensures:
+        if star_index = 0:
+            alignment.star_sighting_1 = sxtsm()
+        else:
+            alignment.star_sighting_2 = sxtsm()
+}
+
+rule CheckStarData {
+    -- R54 / CHKSDATA: validates a pair of star sightings by
+    -- comparing the observed angle between the two stars with
+    -- the catalogue angle. Displays the angular difference for
+    -- astronaut acceptance.
+    when: CheckStarData()
+
+    requires:
+        alignment.star_sighting_1 != null
+        alignment.star_sighting_2 != null
+
+    ensures:
+        let observed_angle = compute_star_angle(alignment.star_sighting_1, alignment.star_sighting_2)
+        let catalogue_angle = compute_catalogue_angle(alignment.selected_stars)
+        let difference = abs(observed_angle - catalogue_angle)
+        DisplayStarAngleDifference(difference: difference)
+
+    @guidance
+        -- CHKSDATA computes ARCCOS(OS1.OS2) for observed and
+        -- stored star pairs. The absolute difference is displayed
+        -- via V06 N05. The astronaut can proceed (accept) or
+        -- recycle (reject, triggering re-sighting).
+}
+
+rule ComputeRefsmmat {
+    -- AXISGEN: computes REFSMMAT from the two pairs of star
+    -- vectors (observed in SM coords, catalogue in inertial).
+    -- The result is the transformation from SM to inertial.
+    when: ComputeRefsmmat()
+
+    requires:
+        alignment.star_sighting_1 != null
+        alignment.star_sighting_2 != null
+
+    ensures:
+        alignment.refsmmat = axisgen(
+            alignment.star_sighting_1,
+            alignment.star_sighting_2,
+            alignment.selected_stars
+        )
+        alignment.refsmmat_valid = true
+
+    @guidance
+        -- AXISGEN builds two orthonormal triads from the star pairs:
+        -- UA = S_A1, VA = UNIT(S_A1 x S_A2), WA = UA x VA
+        -- UB = S_B1, VB = UNIT(S_B1 x S_B2), WB = UB x VB
+        -- Then REFSMMAT rows are:
+        -- X = UB1*UA + VB1*VA + WB1*WA
+        -- Y = UB2*UA + VB2*VA + WB2*WA
+        -- Z = UB3*UA + VB3*VA + WB3*WA
+}
+
+rule GyroTorqueFineAlign {
+    -- R55: computes and sends gyro torquing pulses to fine align
+    -- the stable member. CALCGTA computes the torque angles from
+    -- the desired-vs-present SM orientation (XDC/YDC/ZDC).
+    when: GyroTorqueFineAlign()
+
+    requires: alignment.refsmmat_valid
+
+    ensures:
+        alignment.gyro_torque = calcgta()
+        ImuPulse(torque: alignment.gyro_torque)
+        ImuStall()
+        alignment.phase = fine_aligning
+
+    @guidance
+        -- CALCGTA decomposes the desired SM orientation (XDC,YDC,ZDC)
+        -- into three gyro torquing angles:
+        -- IGC (Y gyro) from the ZP-prime vector
+        -- MGC (Z gyro) from XD2 and the ZP/XD cross terms
+        -- OGC (X gyro) from ZP.ZDC and ZP.YDC
+        -- R55 displays the angles (V06 N93), calls IMUPULSE to
+        -- send the pulse train, then IMUSTALL to wait.
+}
+
+-- P51: IMU Orientation Determination ----------------------------
+
+rule DetermineOrientation {
+    -- P51: determines current IMU orientation from scratch.
+    -- Zeros gimbals, takes two star sightings, computes REFSMMAT.
+    -- Does not coarse align first (the platform is at arbitrary orientation).
+    when: DetermineOrientation()
+
+    requires: alignment.phase = idle
+
+    ensures:
+        alignment.phase = star_sighting
+        alignment.drift_compensation_active = true
+
+    @guidance
+        -- P51 checks BIT9 of IMODES30 (IMU operate mode). If not
+        -- operating, alarm 210 and exit. Otherwise R02ZERO zeros
+        -- the CDUs. The astronaut confirms, then coarse align to
+        -- zero gimbal angles. After IMUSTALL, enters star sighting
+        -- loop for two stars. Each star: R53 (or R56 for P53),
+        -- SXTSM to get SM LOS, PLANET for catalogue vector.
+        -- After both stars: CHKSDATA validates, AXISGEN computes
+        -- REFSMMAT. Sets REFSMFLG.
+}
+
+-- P53: Backup Orientation Determination -------------------------
+
+rule BackupOrientation {
+    -- P53: backup alignment using Sun, Earth, or Moon as references
+    -- instead of stars. Uses R56 alternate sighting routine where
+    -- the astronaut manually enters optics angles.
+    when: BackupOrientation()
+
+    requires: alignment.phase = idle
+
+    ensures:
+        alignment.phase = star_sighting
+
+    @guidance
+        -- P53 equals P51 at entry. The difference is that R56
+        -- is called instead of R53 for sighting marks. R56 uses
+        -- V50 N25 and V53 for alternate mark entry where the
+        -- astronaut keys in shaft and trunnion angles manually.
+        -- The celestial body vector is obtained from PLANET via
+        -- LOCSAM (S50), which computes apparent positions of
+        -- Earth, Moon and Sun corrected for stellar aberration.
+}
+
+-- ANGLFIND: Gimbal angle computation ----------------------------
+
+rule ComputeManoeuvreAxis {
+    -- KALCMAN3: computes the rotation axis and angle for an
+    -- attitude manoeuvre. Builds MIS (initial S/C-to-SM) and
+    -- MFS (final S/C-to-SM) from CDU angles, then derives
+    -- MFI = transpose(MIS) * MFS. Extracts the manoeuvre axis
+    -- (COF) and angle (AM) from MFI's skew-symmetric part.
+    when: ComputeManoeuvreAxis(profile)
+
+    requires: profile.phase = idle
+
+    ensures:
+        let mfi = compute_mfi(profile.initial_matrix, profile.final_matrix)
+        let am = arccos(trace_minus_one_half(mfi))
+        if am < config.manoeuvre_min_angle_degrees:
+            -- Manoeuvre too small: go directly to attitude hold
+            profile.hold_flag = 0
+            StopManoeuvre(profile: profile)
+        else:
+            profile.rotation_axis = extract_rotation_axis(mfi, am)
+            profile.rotation_angle = am
+            CheckGimbalLock(profile: profile)
+            profile.phase = computing
+
+    @guidance
+        -- KALCMAN3 reads current CDUs into BCDU, builds MIS via
+        -- CDUTODCM, builds MFS from commanded angles CPHI/CTHETA/CPSI.
+        -- MFI = TMIS * MFS where TMIS is the transpose of MIS.
+        -- CAM = (MFI[0,0]+MFI[1,1]+MFI[2,2]-1)/2, AM = ARCCOS(CAM).
+        -- If AM < 0.25 degrees, NOGO terminates immediately.
+        -- If AM > 170 degrees, ALTCALC uses MFISYM = (MFI+TMFI)/2
+        -- to compute COF from the diagonal elements. Sign determined
+        -- by COFSKEW and MFISYM off-diagonals. Otherwise COFSKEW
+        -- is normalised directly to get COF.
+}
+
+rule CheckGimbalLock {
+    -- LOCSKIRT / WCALC: checks whether the commanded manoeuvre
+    -- path passes through the gimbal lock region. Computes the
+    -- incremental rotation matrix DEL for a one-second step,
+    -- derives body rates and manoeuvre time, then proceeds to
+    -- steering.
+    when: CheckGimbalLock(profile)
+
+    requires: profile.rotation_axis != null
+
+    ensures:
+        profile.delta_matrix = delcomp(profile.rotation_axis, profile.rotation_angle)
+        profile.body_rates = compute_body_rates(profile.rotation_axis, profile.rate_index)
+        profile.completion_time = compute_manoeuvre_time(profile.rotation_angle, profile.rate_index)
+        profile.biases = compute_attitude_biases(profile.body_rates)
+        profile.phase = steering
+
+    @guidance
+        -- WCALC loads the manoeuvre rate from ARATE table indexed
+        -- by RATEINDX, calls DELCOMP to build the incremental
+        -- rotation matrix DEL from COF and the one-second rotation
+        -- angle. Body rates (BRATE) = ARATE * COF transformed by
+        -- QUADROT into control axes. TM = AM * ANGLTIME / ARATE.
+        -- Bias = BRATE * BIASCALE to provide lead for the DAP.
+        -- Sets CALCMAN2 state switch to start the manoeuvre.
+}
+
+-- KALCMANU Steering ---------------------------------------------
+
+rule SteerManoeuvre {
+    -- NEWDELHI / NEWANGL: generates steering commands each second.
+    -- Computes new MIS = DEL * MIS, extracts new CDU angles via
+    -- DCMTOCDU, computes incremental angle changes for the DAP.
+    when: SteerManoeuvre(profile)
+
+    requires:
+        profile.phase = steering
+        profile.hold_flag < 0
+
+    ensures:
+        profile.initial_matrix = apply_delta(profile.initial_matrix, profile.delta_matrix)
+        profile.commanded_angles = dcmtocdu(profile.initial_matrix)
+        profile.cdu_increments = compute_increments(
+            profile.commanded_angles,
+            profile.current_cdu
+        )
+        SendToDap(increments: profile.cdu_increments)
+
+    @guidance
+        -- NEWDELHI checks HOLDFLAG: if positive, astronaut has
+        -- interrupted the manoeuvre and NOGO terminates it.
+        -- NEWANGL multiplies MIS by DEL via MXM3, extracts new
+        -- CDU angles through DCMTOCDU/V1STO2S into NCDU.
+        -- For each axis: DELCDU = (NCDU - BCDU) * QUADROT / 10.
+        -- These increments are added to CDU desired registers
+        -- every 0.1 seconds by the DAP. BCDU is updated to NCDU.
+        -- TIMECHK compares current time against TM. If time
+        -- remains, schedules UPDTCALL via waitlist for the next
+        -- one-second update.
+}
+
+rule CompleteManoeuvre {
+    -- MANUSTOP / ENDMANU: manoeuvre time has elapsed.
+    -- Stops Y/Z rates, loads final roll angle, stops all rates,
+    -- restores the user's priority and returns via SPVAC.
+    when: ManoeuvreTimeElapsed(profile)
+
+    requires: profile.phase = steering
+
+    ensures:
+        StopRates()
+        profile.commanded_angles = GimbalAngles(
+            outer: profile.commanded_angles.outer,
+            inner: profile.commanded_angles.inner,
+            middle: profile.commanded_angles.middle
+        )
+        profile.phase = complete
+
+    @guidance
+        -- MANUSTOP calls STOPYZ (zeroes DELCDUY/Z, WBODY1/2,
+        -- BIAS1/2), then LOADYZ sets CDUYD/CDUZD to CTHETA/CPSI.
+        -- ENDROLL sets CDUXD to CPHI and calls STOPRATE (zeroes
+        -- DELCDUX, WBODY, BIAS, clears high rate flag).
+        -- ENDMANU restores ATTPRIO to NEWPRIO, clears ATTCADR,
+        -- returns to the calling program via SPVAC.
+}
+
+rule InterruptManoeuvre {
+    -- Astronaut interrupts the automatic manoeuvre via DSKY.
+    -- HOLDFLAG goes positive, NEWDELHI detects it and calls NOGO.
+    when: InterruptManoeuvre(profile)
+
+    requires: profile.phase = steering
+
+    ensures:
+        profile.hold_flag = 1
+        StopRates()
+        profile.phase = idle
+
+    @guidance
+        -- The free control mode (FREECONT) sets HOLDFLAG to +1.
+        -- On the next KALCMANU cycle, NEWDELHI checks CS HOLDFLAG /
+        -- BZMF and branches to NOGOM2 -> NOGO. NOGO calls STOPRATE,
+        -- schedules ENDMANU via waitlist in 20ms.
+}
+
+-- Gimbal Lock Avoidance -----------------------------------------
+
+rule DetectGimbalLock {
+    -- GIMLOCK1 in CALCGA: when the middle gimbal angle exceeds
+    -- 60 degrees, alarm 401 and set GLOKFAIL flag.
+    when: GimbalAngleComputed(middle_gimbal_angle)
+
+    requires:
+        abs(middle_gimbal_angle) > config.gimbal_lock_threshold_degrees
+
+    ensures:
+        Alarm(code: `401`)
+        alignment.phase = alignment.phase
+
+    @guidance
+        -- CALCGA computes MGA = ARCSIN(C3) where C3 is the
+        -- (1,0) element of the direction cosine matrix. It then
+        -- checks ABS(MGC) against .1666... (60/360 revolutions).
+        -- If exceeded, alarm 401 fires and GLOKFAIL flag is set.
+        -- The angle computation continues but the operator is warned.
+}
+
+-- Automatic Manoeuvre Dispatch ----------------------------------
+
+rule AttitudeHold {
+    -- ATTHOLD: computes attitude errors from CDU angles minus
+    -- desired angles, transformed through the gimbal-to-body
+    -- matrix AMGB. Adds biases during automatic manoeuvres.
+    when: AttitudeHoldCycle()
+
+    requires: ManoeuvreProfile.phase != idle
+
+    ensures:
+        let errors = compute_attitude_errors()
+        SendJetCommands(errors: errors)
+
+    @guidance
+        -- ATTHOLD reads CDUX/Y/Z, subtracts THETADX/Y/Z, applies
+        -- the AMGB matrix (body-to-gimbal transformation accounting
+        -- for the 7.25 degree roll offset). During automatic
+        -- manoeuvres (HOLDFLAG negative), BIAS/BIAS1/BIAS2 are
+        -- added to provide lead compensation. The errors feed into
+        -- the phase plane switching logic (JETS) which computes
+        -- jet-on times TAU/TAU1/TAU2.
+}
+
+-- CDUTODCM / DCMTOCDU ------------------------------------------
+
+rule CduToDirectionCosine {
+    -- CDUTODCM: converts three CDU angles (PHI, THETA, PSI) into
+    -- a 3x3 direction cosine matrix relating S/C axes to stable
+    -- member axes.
+    when: CduToDirectionCosine(phi, theta, psi)
+
+    ensures:
+        let dcm = cdutodcm(phi, theta, psi)
+        DirectionCosineComputed(matrix: dcm)
+
+    @guidance
+        -- Iterates through three CDU angles via CDULOGIC, computes
+        -- SIN and COS for each, builds the 9-element DCM.
+        -- Elements C0..C8 follow the standard Euler angle convention
+        -- with PHI=OGA, THETA=IGA, PSI=MGA.
+}
+
+rule DirectionCosineToCdu {
+    -- DCMTOCDU: extracts CDU angles from a direction cosine matrix.
+    -- PSI = ARCSIN(C3), THETA from C0/C6, PHI from C4/C5.
+    -- Handles quadrant ambiguity via sign checks on COS(THETA)
+    -- and COS(PHI).
+    when: DirectionCosineToCdu(matrix)
+
+    ensures:
+        let angles = dcmtocdu(matrix)
+        CduAnglesComputed(angles: angles)
+
+    @guidance
+        -- DCMTOCDU: PSI = ARCSIN(C3), COS(MGA) saved in S1.
+        -- THETA = ARCSIN(-C6/S1), quadrant from sign of C0.
+        -- PHI = ARCSIN(-C5/S1), quadrant from sign of C4.
+        -- COS(MGA) in S1 is used for gimbal lock detection:
+        -- when it approaches zero, the division becomes unstable.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant RefsmmmatRequiredForRealignment {
+    -- P52 (realignment) requires a valid REFSMMAT. P51 establishes it.
+    alignment.phase = fine_aligning implies alignment.refsmmat_valid
+}
+
+invariant TwoStarsRequiredForAlignment {
+    -- Fine alignment requires both star sightings.
+    alignment.phase = fine_aligning implies
+        alignment.star_sighting_1 != null and alignment.star_sighting_2 != null
+}
+
+invariant ManoeuvreNeedsRotationAxis {
+    -- Steering phase requires a computed rotation axis.
+    for profile in ManoeuvreProfiles:
+        profile.phase = steering implies profile.rotation_axis != null
+}
+
+invariant GimbalLockBoundary {
+    -- The gimbal lock region is at ±60 degrees middle gimbal angle.
+    -- Buffer of 2 degrees prevents division-by-zero in DCMTOCDU.
+    for profile in ManoeuvreProfiles:
+        profile.phase = steering implies
+            not profile.gimbal_lock_detected
+            or profile.rotation_axis != null
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Black box functions used in rules:
+-- compute_nominal_orientation(time): S52.3 — ZSMD=UNIT(-R), YSMD=UNIT(VxR), XSMD=UNIT(YSMDxZSMD)
+-- compute_gimbal_angles(orientation, refsmmat): S52.2 — CDUTRIG, CALCSMSC, CALCGA
+-- axisgen(sm_star1, sm_star2, catalogue_pair): AXISGEN — orthonormal triad computation
+-- calcgta(): CALCGTA — gyro torque angle computation
+-- compute_mfi(mis, mfs): KALCMAN3 — MFI = TRANSPOSE(MIS) * MFS
+-- extract_rotation_axis(mfi, am): COFSKEW extraction from MFI
+-- delcomp(axis, angle): DEL = I*cos(a) + UU^T*(1-cos(a)) + UX*sin(a)
+-- dcmtocdu(matrix): DCMTOCDU — direction cosine to CDU angle extraction
+-- cdutodcm(phi, theta, psi): CDUTODCM — CDU angles to direction cosine matrix
+-- sxtsm(): SXTSM — optics mark data to SM LOS vector
+-- compute_body_rates(axis, rate_index): ARATE * COF * QUADROT
+-- compute_manoeuvre_time(angle, rate_index): AM * ANGLTIME / ARATE
+-- compute_attitude_errors(): ATTHOLD error computation through AMGB matrix
+-- find_best_star_pair(): PICAPAR star selection algorithm
+-- stars_in_field_of_view(): PICAPAR field of view check
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred AlignmentState.compute_nominal_orientation    -- see: Comanche055/P51-P53.agc, S52.3
+    -- Propagates CSM state to alignment time via CSMPREC.
+    -- ZSMD = UNIT(-RATT), YSMD = UNIT(VATT x RATT),
+    -- XSMD = UNIT(YSMD x ZSMD).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred AlignmentState.compute_gimbal_angles    -- see: Comanche055/P51-P53.agc, S52.2
+    -- Calls CDUTRIG, CALCSMSC to get current NB axes (XNB,YNB,ZNB).
+    -- Transforms desired SM axes through REFSMMAT. CALCGA produces
+    -- OGC, IGC, MGC converted to THETAD via V1STO2S.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred AlignmentState.axisgen    -- see: Comanche055/INFLIGHT_ALIGNMENT_ROUTINES.agc
+    -- Builds orthonormal triads from two star vector pairs in
+    -- two coordinate systems. The result is the transformation
+    -- matrix (REFSMMAT) relating stable member to inertial.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred AlignmentState.calcgta    -- see: Comanche055/INFLIGHT_ALIGNMENT_ROUTINES.agc
+    -- Computes gyro torque angles (IGC, MGC, OGC) from XDC/YDC/ZDC
+    -- (desired SM orientation relative to present SM). Uses ZPRIME
+    -- intermediate vector and ARCTRIG for quadrant-correct angles.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreProfile.compute_mfi    -- see: Comanche055/ANGLFIND.agc, KALCMAN3
+    -- MIS via CDUTODCM from current CDUs. MFS via CDUTODCM from
+    -- commanded angles. TMIS = TRANSPOSE(MIS). MFI = TMIS * MFS.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreProfile.extract_rotation_axis    -- see: Comanche055/ANGLFIND.agc
+    -- For AM < 170 deg: COF = UNIT(COFSKEW) where COFSKEW is
+    -- the antisymmetric part of MFI.
+    -- For AM >= 170 deg: COF from MFISYM diagonals via
+    -- SQRT((MFISYM[i,i]-CAM)/(1-CAM)). Sign from COFSKEW
+    -- and MFISYM off-diagonals (METHOD1/2/3).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreProfile.delcomp    -- see: Comanche055/ANGLFIND.agc
+    -- DEL = I*COS(A) + UU^T*(1-COS(A)) + UX*SIN(A)
+    -- where U is the unit rotation axis and A is the one-second
+    -- rotation angle (ARATE[RATEINDX] shifted right 4).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ManoeuvreProfile.dcmtocdu    -- see: Comanche055/ANGLFIND.agc
+    -- PSI = ARCSIN(C3). COS(MGA) in S1.
+    -- THETA = ARCSIN(-C6/COS(MGA)), quadrant from C0.
+    -- PHI = ARCSIN(-C5/COS(MGA)), quadrant from C4.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "PICAPAR selects the star pair with maximum angular separation from those meeting the 40-66 degree and field-of-view constraints. If multiple pairs tie on separation, the first found in the catalogue scan order wins. Is this scan order (star 37 down to star 1) intentional or an artefact of the loop structure? The major loop decrements X1 from 228D (37*6+6) while the minor loop decrements X2 from X1. This means higher-numbered stars are tested as the outer partner first."
+
+open question "KALCMANU steering computes CDU increments as (NCDU-BCDU)*QUADROT, where QUADROT accounts for the 7.25-degree roll axis offset between the S/C X-axis and the RCS roll axis. The QUADROT matrix is hardcoded as a constant. If the roll offset were different (e.g. for a different vehicle configuration), QUADROT would need to change. Is there a reason this is not parameterised?"
+
+open question "CALCGA fires alarm 401 when the middle gimbal angle exceeds 60 degrees but continues the computation. The operator is warned but the angles are still used. If the system is already in gimbal lock (MGA near 90 degrees), the DCMTOCDU extraction divides by COS(MGA) which approaches zero. The code does not guard against this division. Is the alarm considered sufficient protection, or is there an upstream guard (e.g. the KALCMANU gimbal lock avoidance path) that prevents this case from being reached during normal operations?"

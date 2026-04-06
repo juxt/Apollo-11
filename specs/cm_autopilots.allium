@@ -1,0 +1,996 @@
+-- allium: 3
+-- Apollo Guidance Computer — CM autopilot subsystems
+-- Thrust vector control, reaction control and entry digital autopilots
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    controller: DapController
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum DapMode { idle | rcs | tvc | sat }
+
+enum VehicleConfig { csm_only | csm_lm_docked | csm_lm_ascent_only }
+
+enum TvcAxis { pitch | yaw }
+
+enum RollRegion { coast | fire_positive | fire_negative }
+
+enum T5Phase { initialise | phase_one | phase_two | restart }
+
+enum EntryPhase { initial | huntest | upcontrol | ballistic | final_phase | kepler }
+
+enum RollDirection { heads_up | heads_down }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value MassProperties {
+    ixx: Decimal
+    iavg: Decimal
+    iavg_per_tlx: Decimal
+
+    @guidance
+        -- IXX is roll moment of inertia, IAVG is the average pitch/yaw
+        -- moment, IAVG/TLX is moment normalised by engine moment arm
+        -- and thrust. All scaled at B+20 in kg-m^2 (or B+2 sec^2 for
+        -- IAVG/TLX). Computed by MASSPROP from CSM mass, LEM mass and
+        -- vehicle configuration (DAPDATR1 bits 15-13).
+}
+
+value FilterState {
+    -- Nodes of the 6th-order pitch or yaw filter
+    n10: Decimal
+    n10_plus_1: Decimal
+    n10_plus_2: Decimal
+    n10_plus_3: Decimal
+    n10_plus_4: Decimal
+    n10_plus_5: Decimal
+}
+
+value ActuatorCommand {
+    pitch_trim: Decimal
+    yaw_trim: Decimal
+    pitch_offset: Decimal
+    yaw_offset: Decimal
+
+    @guidance
+        -- PACTOFF/YACTOFF are the CG-offset trim estimates.
+        -- PDELOFF/YDELOFF are the trim correction deltas.
+        -- Commands are output via optics error counters (CDU channels)
+        -- which generate analog voltages for the actuator servos.
+}
+
+value BodyRate {
+    roll: Decimal
+    pitch: Decimal
+    yaw: Decimal
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity DapController {
+    -- The single DAP mode controller for the CM
+    mode: DapMode
+    vehicle_config: VehicleConfig
+    csm_mass: Decimal
+    lem_mass: Decimal?
+
+    -- Subordinate state machines
+    tvc: TvcState?
+    rcs: RcsState?
+    entry: EntryState?
+
+    -- Only one DAP subsystem is active at a time
+    active_subsystem_count:
+        (if tvc != null: 1 else: 0) +
+        (if rcs != null: 1 else: 0) +
+        (if entry != null: 1 else: 0)
+
+    transitions mode {
+        idle -> tvc
+        idle -> rcs
+        idle -> sat
+        tvc -> rcs
+        tvc -> idle
+        rcs -> tvc
+        rcs -> idle
+        rcs -> sat
+        sat -> idle
+    }
+
+    @guidance
+        -- DAP mode is encoded in FLAGWRD6 bits 14-15.
+        -- 00 = T5IDLOC (idle), 01 = RCS, 10 = TVC, 11 = SAT.
+        -- GOPROG reads these bits at restart to re-initialise the
+        -- correct DAP. The SAT mode is a contingency mode for
+        -- Saturn takeover, not used during normal Apollo 11 operations.
+}
+
+entity TvcState {
+    -- Pitch/yaw thrust vector control during SPS burns
+    current_axis: TvcAxis
+    mass_props: MassProperties
+    pitch_filter: FilterState
+    yaw_filter: FilterState
+    commands: ActuatorCommand
+    body_rate: BodyRate
+
+    -- Pitch/yaw body-axis attitude error integrators
+    pitch_error: Decimal
+    yaw_error: Decimal
+
+    -- CG-offset tracker filter outputs
+    pitch_cg_offset: Decimal
+    yaw_cg_offset: Decimal
+
+    -- Roll DAP state (runs alongside pitch/yaw)
+    roll_error: Decimal
+    roll_region: RollRegion
+    roll_fire_time: Decimal?
+
+    -- Executive phase tracking for restart protection
+    tvc_phase: Integer
+    tvc_exec_phase: Integer
+
+    -- Stroke test state
+    stroke_test_active: Boolean
+    stroke_test_counter: Integer?
+
+    -- Gain update counter (counts down from 19, triggers every 10s)
+    gain_update_counter: Integer
+
+    -- Engine on
+    engine_on: Boolean
+
+    @guidance
+        -- The TVC DAP runs as self-perpetuating T5 tasks. Pitch and
+        -- yaw loops alternate, each firing at half the DAP sample time
+        -- (T5TVCDT, nominally ~100ms total cycle).
+        --
+        -- Architecture per axis: gimbal angle rate derivation ->
+        -- gimbal/body-axis transformation -> body-axis attitude error
+        -- integration (with limiting at ERRORLIM) -> 6th-order digital
+        -- filter (FWDFLTR) -> output limiter (ACTLIM) -> CG-offset
+        -- tracker filter -> minor loop.
+        --
+        -- TVCPHASE and TVCEXPHS are restart phase counters. INCR
+        -- instructions bracket copy-cycles so that TVCRESTARTS can
+        -- resume at the correct point after a GOJAM.
+}
+
+entity RcsState {
+    -- RCS attitude control when SPS engine is off
+    t5_phase: T5Phase
+    body_rate: BodyRate
+
+    -- Attitude errors in body axes
+    error_roll: Decimal
+    error_pitch: Decimal
+    error_yaw: Decimal
+
+    -- Dead-band and rate limit parameters
+    dead_band: Decimal
+    rate_limit: Decimal
+
+    -- Hold flag: positive means hold current attitude
+    hold_mode: Boolean
+
+    -- Jet channel state (channels 5 and 6)
+    channel_5: Integer
+    channel_6: Integer
+
+    -- Body-to-gimbal and gimbal-to-body matrices
+    -- Updated once per second by AMBGUPDT
+    matrix_stale: Boolean
+
+    @guidance
+        -- The RCS DAP is a three-phase T5 interrupt program.
+        -- T5PHASE encodes the current phase:
+        --   + = initialise, +0 = phase 2, - = restart, -0 = phase 1.
+        --
+        -- Phase 1: rate filter and attitude error computation.
+        -- Phase 2: control law (proportional + rate).
+        -- Phase 3: jet selection logic (JETSLECT).
+        --
+        -- AMBGUPDT computes the body-to-gimbal (AMGB) and gimbal-to-
+        -- body (AMBG) transformation matrices from CDU angles once per
+        -- second, accounting for the 7.25-degree jet quad offset
+        -- (QUADANGL).
+}
+
+entity EntryState {
+    -- Entry guidance and DAP during atmospheric reentry
+    phase: EntryPhase
+    bank_angle: Decimal
+    roll_direction: RollDirection
+    drag_acceleration: Decimal
+    range_to_go: Decimal
+    lateral_range: Decimal
+
+    -- Guidance law outputs
+    commanded_lod: Decimal
+    factor: Decimal
+
+    -- Body attitude from gimbal angles
+    body_attitude_valid: Boolean
+
+    -- Timing for restart protection
+    gym_dt: Decimal
+
+    -- DAP active flag
+    dap_active: Boolean
+
+    transitions phase {
+        initial -> huntest
+        initial -> final_phase
+        huntest -> upcontrol
+        huntest -> ballistic
+        upcontrol -> ballistic
+        upcontrol -> kepler
+        ballistic -> upcontrol
+        ballistic -> kepler
+        final_phase -> kepler
+        terminal: kepler
+    }
+
+    @guidance
+        -- READGYMB reads gimbal angles every 0.1s and computes body-
+        -- axis angular differences. CM/DSTBY bit controls whether the
+        -- DAP is active or in standby.
+        --
+        -- Entry guidance (REENTRY_CONTROL) runs as an interpretive
+        -- job under the executive. It computes the desired bank angle
+        -- based on range-to-go, drag, and corridor constraints, then
+        -- modulates the lift vector direction for downrange and
+        -- crossrange control.
+        --
+        -- The guidance phases correspond to distinct control laws:
+        -- HUNTEST: initial monitoring of drag build-up.
+        -- UPCONTROL: lift-up phase to extend range.
+        -- BALLISTIC: constant bank angle (typically heads-down).
+        -- FINAL_PHASE: terminal range corrections with L/D modulation.
+        -- KEPLER: post-atmospheric, no further control.
+        --
+        -- Uses group 6 restart protection with CM/GYMDT for timing
+        -- reconstruction after GOJAM.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- TVC timing
+    tvc_sample_period_cs: Integer = 10
+    tvc_exec_period_cs: Integer = 50
+
+    -- TVC limits
+    error_limit_revs: Decimal = 0.023
+    actuator_limit_revs: Decimal = 0.053
+    rate_limit_revs_per_sample: Decimal = 0.0065
+
+    -- Roll DAP
+    roll_deadband_deg: Decimal = 5.0
+    roll_rate_limit_deg_per_sec: Decimal = 0.1
+    roll_min_fire_ms: Integer = 15
+    roll_max_fire_cs: Integer = 250
+
+    -- RCS timing
+    rcs_sample_period_ms: Integer = 100
+
+    -- Entry timing
+    entry_sample_period_cs: Integer = 10
+
+    -- Mass properties update interval
+    gain_update_interval: Integer = 19
+
+    -- Stroke test
+    stroke_test_pulse_count: Integer = 10
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- DAP mode switching -----------------------------------------
+
+rule ActivateTvcDap {
+    -- TVCDAPON: called by P40 (DOTVCON) via T5 to start
+    -- TVC DAP for an SPS burn.
+    when: ActivateTvcDap(controller)
+
+    requires:
+        controller.mode = idle or controller.mode = rcs
+
+    ensures:
+        controller.mode = tvc
+        let tvc = TvcState.created(
+            current_axis: pitch,
+            mass_props: compute_mass_properties(controller.csm_mass, controller.lem_mass, controller.vehicle_config),
+            pitch_filter: zeroed_filter(),
+            yaw_filter: zeroed_filter(),
+            commands: zeroed_commands(),
+            body_rate: zeroed_rate(),
+            pitch_error: 0,
+            yaw_error: 0,
+            pitch_cg_offset: 0,
+            yaw_cg_offset: 0,
+            roll_error: 0,
+            roll_region: coast,
+            roll_fire_time: null,
+            tvc_phase: 0,
+            tvc_exec_phase: 0,
+            stroke_test_active: false,
+            stroke_test_counter: null,
+            gain_update_counter: config.gain_update_interval,
+            engine_on: false
+        )
+        controller.tvc = tvc
+        controller.rcs = null
+        controller.entry = null
+
+    @guidance
+        -- TVCDAPON performs full initialisation: MRCLEAN zeroes all
+        -- TVC erasables, then TVCINIT1 loads filter coefficients
+        -- based on vehicle configuration (CSM-only vs CSM/LM docked),
+        -- calls MASSPROP for initial mass properties, sets up
+        -- S40.15 gains (VARK and 1/CONACC), initialises the roll DAP
+        -- with CDUX as the reference (OGAD), and schedules the first
+        -- TVCEXEC waitlist task and DAPINIT T5 call.
+        --
+        -- Filter coefficients differ between CSM-only (high bandwidth)
+        -- and CSM/LM (low bandwidth). LOADCOEF loads the appropriate
+        -- set into N10..N10+14D. V46 (SWTCHOVR) can reload
+        -- coefficients during a burn if the configuration changes.
+}
+
+rule ActivateRcsDap {
+    -- RCSDAPON: activates the RCS digital autopilot.
+    when: ActivateRcsDap(controller)
+
+    requires:
+        controller.mode = idle or controller.mode = tvc
+
+    ensures:
+        controller.mode = rcs
+        let rcs = RcsState.created(
+            t5_phase: initialise,
+            body_rate: zeroed_rate(),
+            error_roll: 0,
+            error_pitch: 0,
+            error_yaw: 0,
+            dead_band: 0,
+            rate_limit: 0,
+            hold_mode: true,
+            channel_5: 0,
+            channel_6: 0,
+            matrix_stale: true
+        )
+        controller.rcs = rcs
+        controller.tvc = null
+        controller.entry = null
+}
+
+rule ActivateEntryDap {
+    -- Entry DAP initialisation from CM/POSE via STARTENT.
+    when: ActivateEntryDap(controller, initial_bank, headsup)
+
+    requires: controller.mode = idle or controller.mode = rcs
+
+    ensures:
+        controller.mode = idle
+        let entry = EntryState.created(
+            phase: initial,
+            bank_angle: initial_bank,
+            roll_direction: if headsup: heads_up else: heads_down,
+            drag_acceleration: 0,
+            range_to_go: 0,
+            lateral_range: 0,
+            commanded_lod: 0,
+            factor: 1.0,
+            body_attitude_valid: false,
+            gym_dt: 0,
+            dap_active: true
+        )
+        controller.entry = entry
+        controller.tvc = null
+        controller.rcs = null
+
+    @guidance
+        -- Entry guidance initialises from CM/POSE (called via AVEGEXIT).
+        -- STARTENT sets up switches, loads pad-loaded L/D values (LAD,
+        -- LOD), computes initial trajectory triad (UXA, UYA, UZA) and
+        -- target vector. The entry DAP (READGYMB) is scheduled as a
+        -- group 6 restart-protected task.
+}
+
+rule DeactivateDap {
+    when: DeactivateDap(controller)
+
+    ensures:
+        controller.mode = idle
+        controller.tvc = null
+        controller.rcs = null
+        controller.entry = null
+}
+
+-- TVC pitch/yaw cycle ----------------------------------------
+
+rule TvcPitchCycle {
+    -- PITCHDAP: T5 entry for the pitch control loop.
+    -- Schedules yaw DAP as the next T5 call.
+    when: TvcPitchCycle(tvc)
+
+    requires:
+        tvc.engine_on = true
+        tvc.current_axis = pitch
+
+    ensures:
+        tvc.current_axis = yaw
+        tvc.body_rate = derive_body_rate(tvc)
+        tvc.pitch_error = limit(integrate_error(tvc.pitch_error, tvc.body_rate.pitch))
+        tvc.pitch_filter = apply_filter(tvc.pitch_filter, tvc.pitch_error)
+        tvc.commands = update_pitch_command(tvc.commands, tvc.pitch_filter, tvc.pitch_cg_offset)
+        OutputActuator(axis: pitch, command: tvc.commands)
+
+    @guidance
+        -- PITCHDAP computes CDUYDOT and CDUZDOT from CDU differences,
+        -- applies RLIMTEST to clamp excessive rates (>2.33 deg/sample),
+        -- transforms to body-axis pitch rate (OMEGAYB) via gimbal-to-
+        -- body matrix using SINCDUX/COSCDUX and COSCDUZ, integrates
+        -- the pitch attitude error (PERRB + OMEGAYC - OMEGAYB) with
+        -- ERRORLIM, runs FWDFLTR (the 6th-order filter including
+        -- OPTVARK for variable gain), applies ACTLIM to the output,
+        -- updates the CG-offset tracker via PRECOMP, and issues the
+        -- actuator command through the optics error counter.
+}
+
+rule TvcYawCycle {
+    -- YAWDAP: T5 entry for the yaw control loop.
+    -- Schedules pitch DAP as the next T5 call.
+    when: TvcYawCycle(tvc)
+
+    requires:
+        tvc.engine_on = true
+        tvc.current_axis = yaw
+
+    ensures:
+        tvc.current_axis = pitch
+        tvc.yaw_error = limit(integrate_error(tvc.yaw_error, tvc.body_rate.yaw))
+        tvc.yaw_filter = apply_filter(tvc.yaw_filter, tvc.yaw_error)
+        tvc.commands = update_yaw_command(tvc.commands, tvc.yaw_filter, tvc.yaw_cg_offset)
+        OutputActuator(axis: yaw, command: tvc.commands)
+
+    @guidance
+        -- YAWDAP mirrors PITCHDAP but for the yaw axis. Uses the
+        -- same filter structure with yaw-specific storage locations.
+        -- Body-axis yaw rate (OMEGAZB) is derived from CDUYDOT and
+        -- CDUZDOT via the complementary gimbal-to-body terms.
+}
+
+-- TVC executive and gains ------------------------------------
+
+rule TvcExecutiveCycle {
+    -- TVCEXEC: self-perpetuating waitlist task at 0.5s intervals.
+    -- Updates roll DAP, display needles, mass properties and gains.
+    when: TvcExecutiveCycle(tvc, controller)
+
+    requires: tvc.engine_on = true
+
+    ensures:
+        UpdateRollDap(tvc: tvc)
+        if tvc.gain_update_counter = 0:
+            tvc.mass_props = compute_mass_properties(controller.csm_mass, controller.lem_mass, controller.vehicle_config)
+            tvc.gain_update_counter = config.gain_update_interval
+        else:
+            tvc.gain_update_counter = tvc.gain_update_counter - 1
+        ScheduleTask(task: TvcExecutiveCycle, delay: config.tvc_exec_period_cs)
+
+    @guidance
+        -- TVCEXEC perpetuates itself via WAITLIST at 0.5s intervals.
+        -- ROLLPREP updates roll ladders (OGANOW, OGAPAST) from CDUX,
+        -- computes roll FDAI needle error and phase-plane OGAERR,
+        -- then schedules ROLLDAP via WAITLIST with a 3cs delay.
+        --
+        -- VARGAINS checks the engine-on bit (channel 11 bit 13).
+        -- If off, gains are not updated. If on, VCNTR counts down
+        -- from 19 (10 seconds at 0.5s intervals). At zero, GAINCHNG
+        -- calls FIXCW (MASSPROP fast path) and S40.15 to recompute
+        -- IXX, IAVG, IAVG/TLX, VARK and 1/CONACC. Mass is
+        -- extrapolated by subtracting TENMDOT (10-second mass flow).
+}
+
+rule TvcCgCorrection {
+    -- One-shot and repetitive CG trim corrections.
+    -- Adjusts PACTOFF/YACTOFF to track CG shift during the burn.
+    when: TvcCgCorrection(tvc)
+
+    requires:
+        tvc.engine_on = true
+
+    ensures:
+        tvc.commands = apply_cg_correction(tvc.commands, tvc.pitch_cg_offset, tvc.yaw_cg_offset, tvc)
+
+    @guidance
+        -- 1SHOTCHK counts down CNTR. When CNTR reaches zero (0-3s
+        -- after ignition), a one-shot correction is applied using
+        -- FCORFRAC (OCT 10000, representing the correction fraction).
+        -- After the one-shot, REPCHEK applies repetitive corrections
+        -- using EREPFRAC (pad-loaded) if non-zero.
+        --
+        -- CG.CORR computes: PACTTMP += (4*DELPBAR - 4*PDELOFF) *
+        -- TEMPDAP, and similarly for yaw. The correction fraction is
+        -- doubled for CSM-only (LEM-OFF) since the CG shift per unit
+        -- mass change is larger without the LM.
+        --
+        -- Copy-cycles (EXECCOPY, CORCOPY, CNTRCOPY) are bracketed by
+        -- INCR TVCEXPHS instructions for restart protection.
+}
+
+-- TVC roll DAP -----------------------------------------------
+
+rule TvcRollControl {
+    -- ROLLDAP: phase-plane roll attitude controller during SPS burns.
+    -- Maintains OGA within deadband of OGAD using RCS jet pairs.
+    when: TvcRollControl(tvc)
+
+    requires: tvc.engine_on = true
+
+    ensures:
+        let region = compute_roll_region(tvc.roll_error, tvc.body_rate.roll)
+        tvc.roll_region = region
+        if region = fire_positive or region = fire_negative:
+            tvc.roll_fire_time = compute_fire_time(tvc.roll_error, tvc.body_rate.roll, tvc.mass_props)
+            FireRollJets(direction: region, duration: tvc.roll_fire_time)
+        else:
+            tvc.roll_fire_time = null
+
+    @guidance
+        -- Adapted from the LEM P-axis controller. Uses a phase-plane
+        -- switching logic with a parabolic switching curve. OGAERR is
+        -- the fly-from roll error, OGARATE is derived from OGANOW -
+        -- OGAPAST.
+        --
+        -- Jet pairs fire alternately with at least 0.5s between
+        -- firings of a new pair. Minimum fire time is 15ms, maximum
+        -- is 2.5s (clamped from the 2.56s T6 maximum). Firings may
+        -- be shortened but not extended on re-evaluation.
+        --
+        -- Uses T6 clock for jet timing. 1/CONACC (reciprocal of
+        -- angular acceleration from one jet pair) is the key gain,
+        -- updated every 10s via MASSPROP and S40.15.
+}
+
+-- TVC stroke test --------------------------------------------
+
+rule TvcStrokeTest {
+    -- V68: generates a bending-mode excitation waveform through
+    -- the pitch actuator to test structural response.
+    when: TvcStrokeTest(tvc)
+
+    requires:
+        tvc.engine_on = true
+        tvc.stroke_test_active = false
+
+    ensures:
+        tvc.stroke_test_active = true
+        tvc.stroke_test_counter = config.stroke_test_pulse_count
+
+    @guidance
+        -- STRKTSTI initialises the stroke test. Only runs when
+        -- CSM/LM docked (DAPDATR1 bit 13). HACK generates the
+        -- waveform by dumping pulse bursts of alternating sign into
+        -- TVCPITCH. Pulse burst size is pad-loaded (ESTROKER),
+        -- nominally producing ~1.185 deg amplitude. The waveform has
+        -- multiple frequency components to excite different bending
+        -- modes.
+        --
+        -- Restarts terminate the stroke test (STROKER is zeroed).
+        -- A new V68 is required to re-run.
+}
+
+-- TVC restart ------------------------------------------------
+
+rule TvcRestart {
+    -- REDOTVC: restart recovery for TVC DAP after GOJAM.
+    when: TvcRestart(tvc)
+
+    requires: tvc.tvc_phase >= 0
+
+    ensures:
+        complete_pending_copycycle(tvc)
+        EnableTvc()
+        EnableOpticsErrorCounters()
+        OutputActuator(axis: pitch, command: tvc.commands)
+        OutputActuator(axis: yaw, command: tvc.commands)
+        ReinitialiseFilterRates(tvc: tvc)
+
+    @guidance
+        -- TVCRESTARTS re-enables TVC and optics error counters as
+        -- soon as possible to minimise the transient from actuators
+        -- returning to mechanical null. Commands the current trim
+        -- values (PACTOFF, YACTOFF) immediately.
+        --
+        -- TVCPHASE indexes into a restart table:
+        --   -2: redo V46 switch-over after normal restart
+        --   -1: full reinit at MRCLEAN (early init phase)
+        --    0: partial reinit at TVCINIT4
+        --   1-8: mid-DAP, complete copycycle then TVCINIT4
+        --
+        -- TVCEXPHS similarly indexes the executive restart points
+        -- (0-6), allowing TVCEXEC to resume its copycycle.
+        --
+        -- Roll DAP is simply restarted (not critical). Stroke test
+        -- is terminated (STROKER zeroed).
+}
+
+-- RCS attitude control ---------------------------------------
+
+rule RcsAttitudeControl {
+    -- RCSATT: main T5 entry for RCS attitude control.
+    -- Three-phase execution split across T5 interrupts.
+    when: RcsAttitudeControl(rcs)
+
+    requires: rcs.t5_phase = phase_one or rcs.t5_phase = phase_two
+
+    ensures:
+        if rcs.t5_phase = phase_one:
+            rcs.body_rate = derive_rcs_body_rate(rcs)
+            rcs.error_roll = compute_rcs_error(rcs, roll)
+            rcs.error_pitch = compute_rcs_error(rcs, pitch)
+            rcs.error_yaw = compute_rcs_error(rcs, yaw)
+            rcs.t5_phase = phase_two
+        else:
+            JetSelect(rcs: rcs)
+            rcs.t5_phase = phase_one
+
+    @guidance
+        -- Phase 1 (100ms period): reads CDU angles, derives body
+        -- rates via the rate filter (DRHO = DELRHO - 0.1*ADOT +
+        -- (1-GAIN1)*DRHO; ADOT += GAIN2*DRHO + KMJ*DFT), computes
+        -- attitude errors in body axes via AMBG transformation.
+        --
+        -- Phase 2 (20ms after phase 1): runs jet selection logic
+        -- and outputs jet commands to channels 5 and 6.
+        --
+        -- Checks IMU status (IMODES33 bit 6) and spacecraft control
+        -- switch (channel 31 bit 15). If IMU is off or control is
+        -- not in CMC, zeros errors and sets HOLDFLAG.
+        -- Free mode (channel 31 bit 14) provides rate damping only.
+}
+
+rule RcsInitialise {
+    -- FRESHDAP: full reinitialisation of RCS DAP variables.
+    when: RcsInitialise(rcs)
+
+    requires: rcs.t5_phase = initialise
+
+    ensures:
+        rcs.t5_phase = phase_one
+        rcs.matrix_stale = true
+        rcs.hold_mode = true
+        rcs.channel_5 = 0
+        rcs.channel_6 = 0
+}
+
+rule RcsMatrixUpdate {
+    -- AMBGUPDT: recomputes body-to-gimbal and gimbal-to-body
+    -- transformation matrices from CDU angles. Runs as a job
+    -- once per second.
+    when: RcsMatrixUpdate(rcs)
+
+    requires: rcs.matrix_stale = true
+
+    ensures:
+        rcs.matrix_stale = false
+
+    @guidance
+        -- Computes AMGB and AMBG from CDUX, CDUY, CDUZ.
+        -- AMGB incorporates SPSIN/SPCOS of gimbal angles.
+        -- QUADANGL (7.25 degrees, DEC 660) offsets CDUX to account
+        -- for the physical mounting angle of the RCS jet quads
+        -- relative to the roll axis.
+        --
+        -- Checks FLAGWRD6 to confirm RCS mode before proceeding.
+        -- If TVC is active, exits to protect TVC DAP state.
+}
+
+-- Jet selection logic ----------------------------------------
+
+rule JetSelect {
+    -- JETSLECT: determines which RCS jets to fire based on
+    -- attitude errors and translation commands.
+    when: JetSelect(rcs)
+
+    ensures:
+        let jets = compute_jet_commands(rcs.error_roll, rcs.error_pitch, rcs.error_yaw, rcs)
+        rcs.channel_5 = jets.channel_5
+        rcs.channel_6 = jets.channel_6
+        OutputJets(channel_5: jets.channel_5, channel_6: jets.channel_6)
+
+    @guidance
+        -- JETSLECT first checks channel 31 for translation hand
+        -- controller commands (X, Y, Z translation indices extracted
+        -- via bit masking). Translation commands override attitude
+        -- hold for the affected axes.
+        --
+        -- For each axis, a phase-plane dead-band logic determines
+        -- whether to fire, coast or inhibit. The PWORD/QWORD/RWORD
+        -- lookup tables encode jet selection patterns for coupled
+        -- and uncoupled configurations based on DAPDATR1 (LEM
+        -- attached or not).
+        --
+        -- ATTKALMN selects filter gains: -2 for CSM-only with
+        -- translation, -3 for CSM/LM with translation, 0/-1 for
+        -- attitude-only.
+        --
+        -- Jet channels are zeroed via T6 after 14ms (ZEROJET) to
+        -- implement minimum impulse timing.
+}
+
+-- Entry guidance cycle ---------------------------------------
+
+rule ReadGimbalAngles {
+    -- READGYMB: reads CDU gimbal angles every 0.1s and computes
+    -- body-axis angular differences for the entry DAP.
+    when: ReadGimbalAngles(entry)
+
+    requires: entry.dap_active = true
+
+    ensures:
+        entry.body_attitude_valid = true
+        entry.gym_dt = entry.gym_dt + config.entry_sample_period_cs
+        ComputeBodyRates(entry: entry)
+        ScheduleTask(task: ReadGimbalAngles, delay: config.entry_sample_period_cs)
+
+    @guidance
+        -- Reads CDUX, CDUY, CDUZ and computes differences -DELAOG,
+        -- -DELAIG, -DELAMG from previous values (AOG, AIG, AMG).
+        -- Angles are saved in 2s complement, differences in 1s
+        -- complement.
+        --
+        -- Checks CDU fine-align mode (IMODES33 bit 6). If not in
+        -- fine align, sets GYMDIFSW = 0, quenches jets and idles.
+        --
+        -- CM/DSTBY (CM/FLAGS bit 2) = 1 for DAP operation, 0 to
+        -- terminate. GYMDIFSW (bit 1) prevents body rate computation
+        -- on the first pass after activation.
+        --
+        -- Group 6 restart protection: CM/GYMDT accumulates elapsed
+        -- time relative to PIPTIME, allowing timing reconstruction
+        -- after a restart.
+}
+
+rule EntryGuidanceCycle {
+    -- REENTRY_CONTROL: computes commanded bank angle based on
+    -- range, drag and corridor constraints.
+    when: EntryGuidanceCycle(entry)
+
+    requires:
+        entry.dap_active = true
+        entry.body_attitude_valid = true
+
+    ensures:
+        let guidance = compute_entry_guidance(entry)
+        entry.bank_angle = guidance.bank_angle
+        entry.commanded_lod = guidance.lod
+        entry.phase = guidance.phase
+        BankAngleCommand(entry: entry)
+
+    @guidance
+        -- The entry guidance law operates in distinct phases:
+        --
+        -- HUNTEST: monitors drag build-up after atmospheric interface.
+        -- Transitions to UPCONTROL when drag exceeds threshold (KA).
+        --
+        -- UPCONTROL: modulates L/D to control range. Uses FACTOR as
+        -- a gain that adapts based on range error (DIFF = THETNM -
+        -- ASP). LEWD is the reference L/D, adjusted by range error
+        -- and drag conditions.
+        --
+        -- BALLISTIC: fixed bank angle phase. Entered when lift-up
+        -- is not needed or during skip-out trajectory.
+        --
+        -- FINAL_PHASE: terminal corrections using linear range
+        -- predictions (F1, F2, F3 partials from ENTRY_LEXICON).
+        -- Adjusts L/D to null the remaining range error.
+        --
+        -- KEPLER: post-atmospheric. No further control authority.
+        --
+        -- Lateral logic (LATSW) monitors LATANG and commands roll
+        -- reversals to keep crossrange within limits. KLAT (= LAD/24)
+        -- is the lateral switching gain. K2ROLL tracks the current
+        -- roll direction relative to the lateral corridor.
+}
+
+rule BankAngleCommand {
+    -- Commands the entry DAP to achieve the desired bank angle
+    -- using RCS jets for roll control.
+    when: BankAngleCommand(entry)
+
+    requires: entry.dap_active = true
+
+    ensures:
+        CommandEntryJets(bank_angle: entry.bank_angle, direction: entry.roll_direction)
+
+    @guidance
+        -- The entry DAP commands RCS jets to rotate the CM to the
+        -- desired bank angle. Roll direction (heads-up or heads-down)
+        -- determines which way the lift vector points relative to
+        -- the local vertical.
+        --
+        -- HEADSUP is set at entry initialisation from pad-loaded
+        -- values and may be reversed by the lateral logic during
+        -- the guided phases.
+}
+
+rule EntryDapTerminate {
+    -- CM/DSTBY cleared: terminates the entry DAP.
+    when: EntryDapTerminate(entry)
+
+    requires: entry.dap_active = true
+
+    ensures:
+        entry.dap_active = false
+        FlushJets()
+
+    @guidance
+        -- When CM/DSTBY (CM/FLAGS bit 2) is cleared, READGYMB
+        -- quenches all jets via FLUSHJET, deactivates group 6
+        -- restart protection, and exits via TASKOVER.
+}
+
+-- Mass properties update -------------------------------------
+
+rule UpdateMassProperties {
+    -- MASSPROP: computes moments of inertia and related parameters
+    -- from vehicle mass and configuration.
+    when: UpdateMassProperties(controller)
+
+    requires: controller.tvc != null
+
+    ensures:
+        controller.tvc.mass_props = compute_mass_properties(controller.csm_mass, controller.lem_mass, controller.vehicle_config)
+
+    @guidance
+        -- MASSPROP has two modes:
+        -- (1) Full computation (entry at MASSPROP): recalculates
+        --     breakpoint values and slopes from LEM mass. Required
+        --     when LEM mass or configuration changes.
+        -- (2) Fast update (entry at FIXCW): uses previously computed
+        --     breakpoints, applying only the CSM mass delta. Used
+        --     by TVCEXEC every 10 seconds during a burn.
+        --
+        -- Outputs IXX (roll moment), IAVG (average pitch/yaw moment),
+        -- IAVG/TLX (normalised moment). These feed into VARK and
+        -- 1/CONACC, which are the DAP filter and roll-DAP gains.
+        --
+        -- Vehicle configuration from DAPDATR1 bits 15-13:
+        --   001 = LEM off (CSM only)
+        --   010 = LEM on (ascent + descent stages)
+        --   110 = LEM on (ascent stage only)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant SingleActiveDap {
+    -- At most one DAP subsystem is active at any time.
+    for c in DapControllers:
+        c.active_subsystem_count <= 1
+}
+
+invariant TvcRequiresEngine {
+    -- TVC DAP only runs when the SPS engine is on.
+    for c in DapControllers:
+        c.tvc != null implies c.mode = tvc
+}
+
+invariant JetCommandsMatchMode {
+    -- Jet on/off commands (channels 5, 6) are only non-zero
+    -- when the RCS or Entry DAP is active.
+    for c in DapControllers:
+        c.mode = tvc implies
+            (c.rcs = null or (c.rcs.channel_5 = 0 and c.rcs.channel_6 = 0))
+}
+
+-- NOTE: FLAGWRD6 bits 14-15 must agree with the active DAP subsystem.
+-- 00 = idle (no subsystem), 01 = RCS, 10 = TVC, 11 = SAT.
+-- This is enforced by hardware/software convention but cannot be
+-- expressed as a field-level invariant without modelling the flag word.
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.compute_mass_properties    -- see: Comanche055/TVCMASSPROP.agc
+    -- Full or incremental mass property computation from vehicle
+    -- mass and configuration. Returns IXX, IAVG, IAVG/TLX.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.compute_roll_region    -- see: Comanche055/TVCROLLDAP.agc
+    -- Phase-plane switching logic for roll DAP. Evaluates OGAERR
+    -- and OGARATE against the parabolic switching curve and
+    -- deadband boundaries to determine coast, fire+, or fire-.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.compute_fire_time    -- see: Comanche055/TVCROLLDAP.agc
+    -- Computes jet firing duration from roll error, rate, and
+    -- 1/CONACC. Clamps to [15ms, 2.5s].
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.compute_jet_commands    -- see: Comanche055/JET_SELECTION_LOGIC.agc
+    -- Phase-plane dead-band logic per axis, combined with
+    -- translation hand controller inputs. Produces channel 5
+    -- and channel 6 bit patterns.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.compute_entry_guidance    -- see: Comanche055/REENTRY_CONTROL.agc
+    -- Entry guidance law. Computes bank angle command from drag,
+    -- range-to-go, corridor constraints and flight phase.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.derive_body_rate    -- see: Comanche055/TVCDAPS.agc
+    -- CDU rate derivation and gimbal-to-body transformation for
+    -- TVC pitch/yaw loops. Applies RLIMTEST rate clamping.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.derive_rcs_body_rate    -- see: Comanche055/RCS-CSM_DIGITAL_AUTOPILOT.agc
+    -- Rate filter for RCS DAP. Derives body rates from CDU angle
+    -- differences via AMBG matrix transformation.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.apply_filter    -- see: Comanche055/TVCDAPS.agc
+    -- 6th-order generalised digital filter (FWDFLTR). Operates
+    -- on the six filter nodes. Coefficients loaded by TVCINIT
+    -- differ between CSM-only and CSM/LM configurations.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.zeroed_filter    -- see: Comanche055/TVCINITIALIZE.agc
+    -- Returns a FilterState with all nodes zeroed (MRCLEAN).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.zeroed_commands    -- see: Comanche055/TVCINITIALIZE.agc
+    -- Returns an ActuatorCommand with all trims and offsets zeroed.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DapController.zeroed_rate    -- see: Comanche055/TVCINITIALIZE.agc
+    -- Returns a BodyRate with all components zeroed.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "If the TVC 6th-order filter diverges (accumulator overflow in the filter nodes), what is the observable behaviour? The source code does not appear to include overflow protection within FWDFLTR itself. Overflow in ones-complement arithmetic wraps silently. A divergent filter would produce wild actuator commands, potentially hitting the ACTLIM output limiter, but the limiter only clamps the final output — intermediate node values could still be corrupted. Whether the filter can self-recover after a transient overflow, or whether it would latch into a saturated state, is unclear."
+
+open question "What is the worst-case actuator latency between a body-axis attitude error arising and the corrective actuator command reaching the SPS gimbal servo? The signal path is: CDU read -> rate derivation -> error integration -> 6th-order filter -> output limiter -> optics error counter -> analog servo. The digital portion runs within one T5 period (~50ms per axis), but the analog servo response time and the optics error counter D/A conversion rate add further delay. The total latency budget is relevant for stability margins but is not documented in the AGC source."
+
+-- Resolved: DAP mode-switch has a real but mitigated race window
+--
+-- RCSDAPON (Comanche055/P40-P47.agc line 2409) updates T5LOC to
+-- point to RCSATT before updating FLAGWRD6 mode bits. The comment
+-- states "RCSDAPON ENTRY MUST BE UNDER INT-INHIBIT" but the actual
+-- caller (DOTVCRCS at line 663) does not execute INHINT before
+-- calling RCSDAPON via IBNKCALL.
+--
+-- The mitigation is the 0.6-second scheduling delay: TIME5 is set
+-- to 0.6SECT5, giving TVC T5 tasks time to wind down before the
+-- RCS DAP's first T5 fires.
+--
+-- Worst case: one spurious gimbal command (single actuation pulse)
+-- if a stale TVC T5 task fires between the T5LOC update and the
+-- FLAGWRD6 update. The window is approximately 4-5 instructions.
+-- Practically negligible due to the 0.6-second scheduling delay,
+-- but the code does not match its own stated requirements.

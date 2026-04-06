@@ -1,0 +1,703 @@
+-- allium: 3
+-- Apollo Guidance Computer — Executive subsystem
+-- Priority-scheduled cooperative multitasking kernel
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    executive: Executive
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum AgcVariant { comanche055_cm | luminary099_lm }
+
+enum JobState { ready | running | sleeping | terminated }
+
+enum JobKind { basic | interpretive }
+
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value RegisterBlock {
+    loc: Integer
+    bankset: Integer
+    pushloc: Integer
+    priority: Integer
+    mode: Integer
+    mpac_0: Integer
+    mpac_1: Integer
+    mpac_2: Integer
+    mpac_3: Integer
+    mpac_4: Integer
+    mpac_5: Integer
+    mpac_6: Integer
+
+    @guidance
+        -- MODE encodes the arithmetic type of the current operation:
+        -- +1 for triple-precision (TP), +0 for double-precision (DP),
+        -- -1 for vector. Used by the interpreter to select operand width.
+        --
+        -- The register layout is 12 words per core set:
+        -- MPAC+0..+6 (7), MODE (1), LOC (1), BANKSET (1), PUSHLOC (1),
+        -- PRIORITY (1).
+        --
+        -- NOTE: The source comments at Comanche055 EXECUTIVE line 156
+        -- state "ELEVEN REGISTERS" but the actual allocation is twelve.
+        -- This is a stale comment in the original code.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity VacArea {
+    -- Interpretive work area
+    index: Integer
+    in_use: Boolean
+
+    invariant ValidIndex {
+        index >= 1 and index <= config.max_vac_areas
+    }
+}
+
+entity CoreSet {
+    -- A core set holds a job's execution state
+    index: Integer
+    state: RegisterBlock?
+    job: Job?
+
+    -- Core set 0 is the active run position
+    is_run_position: index = 0
+
+    invariant ValidIndex {
+        index >= 0 and index < config.max_core_sets
+    }
+}
+
+entity Job {
+    kind: JobKind
+    state: JobState
+    priority: Integer
+    core_set: CoreSet
+    vac_area: VacArea?
+    entry_point: Integer
+    bankset: Integer
+
+    -- Interpretive jobs store complemented LOC (negative)
+    is_interpretive: kind = interpretive
+
+    -- A sleeping job has its priority negated
+    is_sleeping: state = sleeping
+
+    transitions state {
+        ready -> running
+        running -> sleeping
+        running -> terminated
+        sleeping -> ready
+        sleeping -> terminated
+        terminal: terminated
+    }
+}
+
+entity Executive {
+    -- The kernel itself, one instance per AGC
+    variant: AgcVariant
+    current_job: Job?
+    new_job_pending: Boolean
+    activity_light: Boolean
+
+    -- All managed resources
+    core_sets: CoreSet with job != null
+    vac_areas: VacArea with in_use = true
+
+    -- Derived state
+    highest_priority_job: Job?
+
+    -- The executive is idle when EJSCAN found no active jobs and
+    -- DUMMYJOB was entered. This is distinct from the transient
+    -- state during ENDOFJOB where current_job is null but EJSCAN
+    -- has not yet completed.
+    idle: Boolean
+
+    @guidance
+        -- NEWJOB register in the AGC tracks whether a higher-priority
+        -- job is waiting. Positive NEWJOB holds the core set index of
+        -- the waiting job. +0 means a job is in core set 0 ready to
+        -- run. -0 means no job is pending (idle or current job is
+        -- highest priority).
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    max_vac_areas: Integer = 5
+    max_core_sets_cm: Integer = 7
+    max_core_sets_lm: Integer = 8
+
+    -- Active value depends on variant:
+    -- comanche055_cm: 7, luminary099_lm: 8
+    max_core_sets: Integer
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Job creation ------------------------------------------------
+
+rule CreateJobNovac {
+    -- NOVAC entry point: creates a job without a VAC area.
+    -- Adds FAKEPRET to the accumulator before storing, encoding
+    -- the FIXLOC offset for non-VAC jobs.
+    when: CreateJobNovac(entry_point, priority, bankset)
+
+    let free_core_set = find_free_core_set()
+
+    requires: free_core_set != null
+
+    ensures:
+        let job = Job.created(
+            kind: basic,
+            state: ready,
+            priority: priority,
+            core_set: free_core_set,
+            vac_area: null,
+            entry_point: entry_point,
+            bankset: bankset
+        )
+        free_core_set.job = job
+        if priority > executive.current_job.priority:
+            executive.new_job_pending = true
+            executive.highest_priority_job = job
+
+    @guidance
+        -- NOVAC adds FAKEPRET to A before storing in NEWPRIO. This
+        -- encodes the FIXLOC offset so the dispatcher knows the job
+        -- does not use a VAC area.
+}
+
+rule CreateJobNovacExhaustion {
+    when: CreateJobNovac(entry_point, priority, bankset)
+
+    let free_core_set = find_free_core_set()
+
+    requires: free_core_set = null
+
+    ensures: Bailout(alarm_code: `1202`)
+
+    @guidance
+        -- All core sets occupied. Alarm 1202.
+}
+
+rule CreateJobFindvac {
+    -- FINDVAC entry point: creates a job with a VAC area for
+    -- interpretive work. Stores the VAC area base address in
+    -- the low 9 bits of NEWPRIO.
+    when: CreateJobFindvac(entry_point, priority, bankset)
+
+    let free_vac = find_free_vac_area()
+    let free_core_set = find_free_core_set()
+
+    requires:
+        free_vac != null
+        free_core_set != null
+
+    ensures:
+        free_vac.in_use = true
+        let job = Job.created(
+            kind: interpretive,
+            state: ready,
+            priority: priority,
+            core_set: free_core_set,
+            vac_area: free_vac,
+            entry_point: entry_point,
+            bankset: bankset
+        )
+        free_core_set.job = job
+        if priority > executive.current_job.priority:
+            executive.new_job_pending = true
+            executive.highest_priority_job = job
+}
+
+rule CreateJobFindvacVacExhaustion {
+    when: CreateJobFindvac(entry_point, priority, bankset)
+
+    let free_vac = find_free_vac_area()
+
+    requires: free_vac = null
+
+    ensures: Bailout(alarm_code: `1201`)
+
+    @guidance
+        -- All 5 VAC areas in use. Alarm 1201.
+}
+
+rule CreateJobFindvacCoreExhaustion {
+    when: CreateJobFindvac(entry_point, priority, bankset)
+
+    let free_vac = find_free_vac_area()
+    let free_core_set = find_free_core_set()
+
+    requires:
+        free_vac != null
+        free_core_set = null
+
+    ensures: Bailout(alarm_code: `1202`)
+}
+
+rule CreateJobSpvac {
+    -- SPVAC variant: takes 2CADR in A,L with priority pre-set
+    -- in NEWPRIO. Behaves like FINDVAC but the caller has already
+    -- prepared the priority register.
+    when: CreateJobSpvac(entry_point, bankset, priority)
+
+    let free_vac = find_free_vac_area()
+    let free_core_set = find_free_core_set()
+
+    requires:
+        free_vac != null
+        free_core_set != null
+
+    ensures:
+        free_vac.in_use = true
+        let job = Job.created(
+            kind: interpretive,
+            state: ready,
+            priority: priority,
+            core_set: free_core_set,
+            vac_area: free_vac,
+            entry_point: entry_point,
+            bankset: bankset
+        )
+        free_core_set.job = job
+        if priority > executive.current_job.priority:
+            executive.new_job_pending = true
+            executive.highest_priority_job = job
+}
+
+-- Scheduling and context switch --------------------------------
+
+rule DispatchHighestPriority {
+    -- CHANJOB: swaps core set 0 with the target core set holding
+    -- the highest-priority ready job. Always entered with
+    -- interrupts inhibited.
+    when: executive: Executive.new_job_pending becomes true
+
+    let target = executive.highest_priority_job
+
+    requires:
+        target != null
+        target.state = ready
+
+    ensures:
+        if executive.current_job != null:
+            executive.current_job.state = ready
+            ContextSwapOut(job: executive.current_job)
+        target.state = running
+        executive.current_job = target
+        executive.new_job_pending = false
+        ContextSwapIn(job: target)
+
+    @guidance
+        -- CHANJOB swaps LOC, BANKSET, MPAC registers, MODE, PUSHLOC,
+        -- PRIORITY and OVFIND between core set 0 and the target.
+        --
+        -- OVFIND/PUSHLOC encoding: before the DXCH swap, OVFIND is
+        -- packed into the sign of PUSHLOC. If OVFIND is non-zero,
+        -- PUSHLOC is negated (COM). After the swap into the new job's
+        -- context, the sign of PUSHLOC is tested: negative means OVFIND
+        -- was set, so PUSHLOC is un-negated and OVFIND restored to 1.
+        -- Positive or +0 means OVFIND stays 0. The -0 case (PUSHLOC
+        -- was +0 with OVFIND set) is handled correctly: CCS of -0
+        -- falls to the fourth branch, which restores OVFIND. This
+        -- exploits the ones'-complement distinction between +0 and -0.
+        --
+        -- Job dispatch (ENDPRCHG): DXCH LOC loads LOC and BANKSET
+        -- into A and L. BZMF tests whether LOC <= 0 to distinguish
+        -- job types:
+        -- - Basic jobs (LOC positive): DTCB dispatches with full
+        --   superbank context.
+        -- - Interpretive jobs (LOC negative, ones'-complement): COM
+        --   flips all bits, then AD ONE adds 1 to convert from ones'-
+        --   complement negative back to the true positive address.
+        --   This is NOT twos'-complement negation. On a twos'-complement
+        --   machine, COM + AD ONE would be a no-op; on the AGC it
+        --   performs the correct inversion. The result is stored in LOC
+        --   and TCF INTRSM resumes the interpreter.
+        --
+        -- SUPDXCHZ transfers control with full superbank context;
+        -- it lives in fixed-fixed memory so all banks can reach it.
+}
+
+-- Voluntary yield ---------------------------------------------
+
+rule YieldBasicJob {
+    -- CHANG1: a basic job voluntarily yields to let a
+    -- higher-priority job run.
+    when: YieldBasicJob(job)
+
+    requires:
+        job.state = running
+        job.kind = basic
+        executive.new_job_pending = true
+
+    ensures:
+        job.state = ready
+        ContextSwapOut(job: job)
+        DispatchHighestPriority(executive: executive)
+}
+
+rule YieldInterpretiveJob {
+    -- CHANG2: an interpretive job voluntarily yields.
+    when: YieldInterpretiveJob(job)
+
+    requires:
+        job.state = running
+        job.kind = interpretive
+        executive.new_job_pending = true
+
+    ensures:
+        job.state = ready
+        ContextSwapOut(job: job)
+        DispatchHighestPriority(executive: executive)
+}
+
+-- Sleep and wake ----------------------------------------------
+
+rule JobSleep {
+    -- JOBSLEEP: puts the current job to sleep by negating its
+    -- priority. The job will not be selected by EJSCAN until woken.
+    when: JobSleep(job)
+
+    requires: job.state = running
+
+    ensures:
+        job.state = sleeping
+        job.priority = -job.priority
+        DispatchHighestPriority(executive: executive)
+
+    @guidance
+        -- Negating PRIORITY makes the CCS instruction in EJSCAN
+        -- skip the sleeping job, since CCS branches differently
+        -- for negative values.
+}
+
+rule JobWake {
+    -- JOBWAKE: scans all core sets for a sleeping job whose LOC
+    -- matches the supplied CADR. Wakes it by restoring positive
+    -- priority.
+    when: JobWake(cadr)
+
+    let target = find_sleeping_job_by_cadr(cadr)
+
+    requires: target != null
+
+    ensures:
+        target.state = ready
+        target.priority = -target.priority
+        if target.priority > executive.current_job.priority:
+            executive.new_job_pending = true
+            executive.highest_priority_job = target
+
+    @guidance
+        -- JOBWAKE reconstructs a 2CADR from the CADR in NEWLOC
+        -- and the EBANK portion saved in BANKSET, then scans each
+        -- core set's LOC register for a match.
+}
+
+rule JobWakeNotFound {
+    -- When no sleeping job matches the supplied CADR, LOCCTR
+    -- is set to -1 to signal failure.
+    when: JobWake(cadr)
+
+    let target = find_sleeping_job_by_cadr(cadr)
+
+    requires: target = null
+
+    ensures: JobWakeFailed(cadr: cadr)
+
+    @guidance
+        -- Sets LOCCTR to -1. The caller must handle this case.
+}
+
+-- Priority change ---------------------------------------------
+
+rule ChangePriority {
+    -- PRIOCHNG: changes the running job's priority. Preserves the
+    -- VAC area bits (low 9 bits) from the old priority encoding.
+    -- Rescans to check if this job is still highest priority.
+    when: ChangePriority(job, new_priority)
+
+    requires: job.state = running
+
+    ensures:
+        job.priority = new_priority
+        if not is_highest_priority(job):
+            executive.new_job_pending = true
+
+    @guidance
+        -- The low 9 bits of PRIORITY encode the VAC area address
+        -- (LOW9). PRIOCHNG preserves these bits, changing only the
+        -- upper priority bits. After the change, EJSCAN runs to
+        -- determine if the current job is still highest priority.
+}
+
+-- Job termination ---------------------------------------------
+
+rule EndOfJob {
+    -- ENDOFJOB: releases the core set and VAC area (if any),
+    -- then scans for the next highest-priority job.
+    when: EndOfJob(job)
+
+    requires: job.state = running
+
+    ensures:
+        job.state = terminated
+        job.core_set.job = null
+        if job.vac_area != null:
+            job.vac_area.in_use = false
+        executive.current_job = null
+        DispatchHighestPriority(executive: executive)
+
+    @guidance
+        -- Sets the core set's PRIORITY to -0 (free marker).
+        -- Releases the VAC area if one was allocated. Then runs
+        -- EJSCAN to find the next job.
+        --
+        -- VAC area release mechanism: ENDOFJOB extracts LOW9 from
+        -- PRIORITY (the VAC base address) and compares against
+        -- FAKEPRET to determine if this was a NOVAC or FINDVAC job.
+        -- For FINDVAC jobs: CCS diminishes the address by 1, then
+        -- INDEX/TS stores a non-zero value (the diminished address
+        -- itself) at VACnUSE, the register immediately before the
+        -- VAC area. Non-zero VACnUSE means "free" and zero means
+        -- "in-use". This is counterintuitive: FINDVAC2's CCS will
+        -- branch to VACFOUND when VACnUSE is non-zero. An in-use
+        -- VAC area has VACnUSE = 0, stored by VACFOUND via LXCH
+        -- with L = 0.
+}
+
+-- Idle loop ---------------------------------------------------
+
+rule EnterIdleLoop {
+    -- DUMMYJOB: when no jobs are ready, the Executive enters
+    -- an idle polling loop. Sets NEWJOB to -0, turns off the
+    -- activity light, and polls until a job becomes ready.
+    when: executive: Executive.idle becomes true
+
+    ensures:
+        executive.activity_light = false
+        executive.new_job_pending = false
+
+    @guidance
+        -- The idle loop (DUMMYJOB) polls NEWJOB in a tight loop.
+        -- When NEWJOB goes positive (a job became ready, typically
+        -- via an interrupt-driven FINDVAC or NOVAC), the loop exits,
+        -- turns the activity light back on, and dispatches.
+}
+
+rule ExitIdleLoop {
+    -- ADVAN detects NEWJOB > 0, meaning a job has arrived.
+    -- Turns the activity light on and dispatches.
+    when: executive: Executive.new_job_pending becomes true
+
+    requires: executive.idle = true
+
+    ensures:
+        executive.activity_light = true
+        DispatchHighestPriority(executive: executive)
+
+    @guidance
+        -- ADVAN polls NEWJOB via CCS with interrupts enabled:
+        -- - NEWJOB > 0: TCF NUCHANG2 (job waiting, context switch needed)
+        -- - NEWJOB = +0: job already in core set 0, dispatch via NUDIRECT
+        -- - NEWJOB = -0: idle, run self-check (TC AGCTCALL) and loop back
+        -- The transition from idle to dispatching is the normal exit.
+}
+
+rule IdleRaceCondition {
+    -- Between the CCS NEWJOB in ADVAN (interrupts enabled) and
+    -- the INHINT in NUCHANG2, an interrupt can fire that moves
+    -- the arriving job into core set 0. NEWJOB was positive at
+    -- the CCS, but by NUCHANG2's re-check under INHINT, it is
+    -- now +0. The code handles this by falling through to
+    -- ADVAN+2 -> NUDIRECT, dispatching directly without a
+    -- context swap.
+    when: executive: Executive.new_job_pending becomes true
+
+    requires:
+        executive.idle = true
+        executive.highest_priority_job.core_set.index = 0
+
+    ensures:
+        executive.activity_light = true
+        executive.new_job_pending = false
+        executive.current_job = executive.highest_priority_job
+        executive.current_job.state = running
+
+    @guidance
+        -- Original comment: "VERY RARE CASE". Between CCS NEWJOB
+        -- (interrupts released) and INHINT in NUCHANG2, an interrupt
+        -- can service the arriving job directly into core set 0.
+        -- NUCHANG2 re-checks NEWJOB under INHINT, finds +0, and
+        -- goes to NUDIRECT instead of performing a full context swap.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant SingleRunningJob {
+    -- At most one job is in the running state at any time.
+    for a in Jobs:
+        for b in Jobs:
+            a != b implies not (a.state = running and b.state = running)
+}
+
+invariant CoreSetZeroIsRunPosition {
+    -- Core set 0 always holds the currently running job (if any).
+    for job in Jobs:
+        job.state = running implies job.core_set.index = 0
+}
+
+invariant SleepingJobsHaveNegativePriority {
+    for job in Jobs:
+        job.state = sleeping implies job.priority < 0
+}
+
+invariant ReadyJobsHavePositivePriority {
+    for job in Jobs:
+        job.state = ready implies job.priority > 0
+}
+
+invariant VacAreaBound {
+    for area in VacAreas:
+        area.in_use implies area.index >= 1 and area.index <= config.max_vac_areas
+}
+
+invariant InterpretiveJobsHaveVacArea {
+    for job in Jobs:
+        job.kind = interpretive and job.state != terminated
+            implies job.vac_area != null
+}
+
+invariant BasicJobsHaveNoVacArea {
+    for job in Jobs:
+        job.kind = basic implies job.vac_area = null
+}
+
+invariant FreeCoreSetsHaveNoJob {
+    for cs in CoreSets:
+        cs.job = null implies cs.state = null
+}
+
+------------------------------------------------------------
+-- Implementation notes
+------------------------------------------------------------
+
+-- SPECTEST implicit assertion
+--
+-- When a new job is loaded into core set 0 (entered when LOCCTR = 0),
+-- SPECTEST checks NEWJOB via CCS. Only two outcomes are handled:
+--   NEWJOB > 0: another job was already flagged, branch to SETLOC
+--   NEWJOB = -0: normal case, store +0 to mark "active job set"
+-- The +0 and negative branches are TC CCSHOLE — deliberate traps.
+-- NEWJOB = +0 should never occur because +0 is only written by
+-- SPECTEST itself, and entering SPECTEST twice for the same job
+-- would require the core set allocation to have failed earlier.
+-- Negative NEWJOB values have no defined meaning.
+
+-- NO.CORES / CCS dual-use
+--
+-- The constant NO.CORES (DEC 6 in CM, DEC 7 in LM) occupies the
+-- +0 branch of CCS PRIORITY in the core set scan loop. Dual purpose:
+-- it provides the loop iteration count when read as data, and it
+-- acts as a CCS trap when reached as code. PRIORITY should never
+-- be +0: free core sets have -0, active jobs have positive priority,
+-- sleeping jobs have negative priority. The four-state CCS encoding
+-- is central to the executive's design: three of the four branches
+-- map directly to the three possible PRIORITY states, and the fourth
+-- (+0) is repurposed as a constant.
+
+-- Priority register is a packed word
+--
+-- PRIORITY is not a pure priority value. The low 9 bits (masked by
+-- LOW9) encode the base address of the job's VAC area, or a FIXLOC
+-- offset for NOVAC jobs. The upper bits encode scheduling priority.
+-- All priority comparisons and EJSCAN scans operate on the full
+-- packed word. Because VAC area addresses are small relative to
+-- priority values, this packing does not affect scheduling order
+-- in practice — but it means two jobs with identical priority bits
+-- will be ordered by their VAC area address, which is an allocation
+-- artefact rather than intentional.
+
+-- Source comment errors found during distillation
+--
+-- 1. Comanche055/EXECUTIVE.agc line 156: "SEVEN SETS OF ELEVEN
+--    REGISTERS EACH". Seven is correct. Eleven is wrong — the
+--    erasable layout allocates twelve registers per core set
+--    (MPAC+0..+6, MODE, LOC, BANKSET, PUSHLOC, PRIORITY). Confirmed
+--    by ERASABLE_ASSIGNMENTS.agc line 1627: "ERASE +71D" = 72 words
+--    = 6 additional sets × 12 registers.
+--
+-- 2. Luminary099/EXECUTIVE.agc line 157: same comment, "SEVEN SETS
+--    OF ELEVEN REGISTERS EACH". Both figures are wrong. The LM has
+--    eight core sets and twelve registers per set. The comment was
+--    copied from Comanche055 and not updated.
+--
+-- 3. Luminary099/ERASABLE_ASSIGNMENTS.agc line 374: the section
+--    header says "(84D)" but the actual allocation is ERASE +83D
+--    = 84 additional words + 12 for core set 0 = 96 words (8 × 12).
+--    84D is the Comanche055 figure (7 × 12) carried forward.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+open question "EJSCAN compares full packed PRIORITY words (priority + VAC address in low 9 bits). Two jobs with identical scheduling priority but different VAC area allocations will have different PRIORITY values. Does EJSCAN's 'highest priority' determination ever depend on which VAC area was assigned? In principle yes — the comparison is arithmetic on the full word. In practice the VAC address contribution is small enough that it should not change the outcome for any real priority assignment. But this is an implicit assumption, not a checked invariant."
+
+open question "JOBWAKE matches sleeping jobs by comparing NEWLOC against each core set's LOC register. If two jobs sleep at the same CADR (the same instruction address), JOBWAKE will wake whichever it finds first in the linear scan. Is this intentional? The scan order is deterministic (core set 1, 2, 3...) so the earliest-allocated sleeping job at that address wins. If a caller expects to wake a specific job among several sleeping at the same address, JOBWAKE cannot distinguish them."
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Black box functions used in rules:
+-- find_free_core_set(): scans core sets linearly for one with PRIORITY = -0
+-- find_free_vac_area(): scans VAC1USE through VAC5USE linearly for a free area
+-- find_sleeping_job_by_cadr(cadr): scans core sets for a sleeping job whose LOC matches cadr
+-- is_highest_priority(job): runs EJSCAN to check if job outranks all others
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Executive.find_free_core_set    -- see: Comanche055/EXECUTIVE.agc, Luminary099/EXECUTIVE.agc
+    -- Linear scan of core sets. A core set is free when its
+    -- PRIORITY register contains -0. Returns null if all occupied.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Executive.find_free_vac_area    -- see: Comanche055/EXECUTIVE.agc, Luminary099/EXECUTIVE.agc
+    -- Linear scan of VAC1USE through VAC5USE. Returns the base
+    -- address of the first free area, or null if all 5 are in use.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Executive.find_sleeping_job_by_cadr    -- see: Comanche055/EXECUTIVE.agc, Luminary099/EXECUTIVE.agc
+    -- Scans all core sets for a sleeping job whose LOC matches
+    -- the supplied CADR. Reconstructs a 2CADR from NEWLOC and
+    -- the EBANK portion in BANKSET.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Executive.is_highest_priority    -- see: Comanche055/EXECUTIVE.agc, Luminary099/EXECUTIVE.agc
+    -- EJSCAN: examines each non-zero core set's PRIORITY register
+    -- using CCS. Skips sleeping jobs (negative priority). Tracks
+    -- the highest priority found and its location. Skips core set 0
+    -- (the running job).
+    -- CM (Comanche055): scans PRIORITY +12D through +72D (6 sets).
+    -- LM (Luminary099): scans PRIORITY +12D through +84D (7 sets).

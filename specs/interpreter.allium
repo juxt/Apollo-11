@@ -1,0 +1,868 @@
+-- allium: 3
+-- Apollo Guidance Computer — Interpreter subsystem
+-- Software virtual machine for double-precision, triple-precision
+-- and vector arithmetic within interpretive jobs
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    interpreter: Interpreter
+    executive: Executive
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum AgcVariant { comanche055_cm | luminary099_lm }
+
+enum DataMode { double_precision | triple_precision | vector }
+
+-- allium-ignore allium.definition.unused
+enum OpcodeClass { address | misc | unary | short_shift }
+
+enum StoreType { store | stodl | stovl | stcall }
+
+enum AddressKind { direct | indexed | pushdown }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- allium-ignore allium.definition.unused
+value OpcodeWord {
+    -- A word in the interpretive instruction stream, either an
+    -- opcode pair (negative) or a store code (positive).
+    raw: Integer
+
+    is_opcode_pair: raw < 0
+    is_store_code: raw > 0
+
+    @guidance
+        -- The sign bit (bit 15) distinguishes the two cases.
+        -- CCS in NEWOPS simultaneously tests the sign and extracts
+        -- the diminished absolute value for EDOP.
+}
+
+-- allium-ignore allium.definition.unused
+value OpcodePair {
+    -- Two 7-bit opcodes packed in 14 bits of a negative word.
+    right_opcode: Integer    -- bits 7-1, executed first
+    left_opcode: Integer     -- bits 14-8, executed second
+
+    @guidance
+        -- Right opcode is extracted by MASK LOW7. Left opcode
+        -- remains in EDOP for the next DANZIG cycle. The CCS
+        -- decrement means EDOP holds the diminished value;
+        -- OPJUMP adds 1 back to recover the true opcode.
+}
+
+-- allium-ignore allium.definition.unused
+value StoreCode {
+    -- Positive word encoding a store operation.
+    address: Integer
+    store_type: StoreType
+    is_indexed: Boolean
+
+    @guidance
+        -- Upper bits encode the store type (00, 01, 10, 11).
+        -- The address portion targets erasable memory.
+        -- Indexed store addresses are stored COMPLEMENTED in the
+        -- instruction stream. CCS in DOSTORE detects complemented
+        -- addresses and increments INDEXLOC to select X2 over X1.
+}
+
+-- allium-ignore allium.definition.unused
+value AddressOperand {
+    -- A resolved operand address after address resolution.
+    kind: AddressKind
+    effective_address: Integer
+
+    @guidance
+        -- Direct addresses < 45D are VAC-relative (FIXLOC added).
+        -- General erasable addresses trigger E-bank switching.
+        -- Fixed memory addresses trigger F-bank switching with
+        -- INTBIT15. Indexed addresses are augmented by X1 or X2
+        -- (selected by bit 2 of the stored address). Push-down
+        -- operands come from the push-down list at PUSHLOC.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity Interpreter {
+    variant: AgcVariant
+
+    -- Interpretive program counter
+    loc: Integer
+
+    -- Bank context saved at entry, restored at DANZIG
+    bankset: Integer
+
+    -- Bit 15 of FBANK at entry, used for bank distinction
+    intbit15: Integer
+
+    -- Second opcode from previous pair, waiting for execution
+    edop: Integer
+
+    -- Current data type
+    mode: DataMode
+
+    -- Multi-purpose accumulator (7 words)
+    mpac: List<Integer>
+
+    -- Push-down list pointer (next free position, grows downward)
+    pushloc: Integer
+
+    -- Overflow indicator, tested by BOV/BOVB
+    ovfind: Boolean
+
+    -- Saved return address for CALL/RVQ
+    qpret: Integer
+
+    -- Reference to the VAC area base address
+    fixloc: Integer
+
+    @guidance
+        -- MPAC through MPAC+6: usage depends on MODE.
+        -- DP: MPAC, MPAC+1 (MPAC+2 zeroed for sign extension).
+        -- TP: MPAC, MPAC+1, MPAC+2.
+        -- Vector: MPAC,+1 (X), MPAC+3,+4 (Y), MPAC+5,+6 (Z).
+        -- MPAC+2 doubles as scratch in some vector operations.
+        --
+        -- The push-down list lives in the VAC area, growing
+        -- downward from the top. PUSHLOC points to the next free
+        -- position. Push amounts depend on MODE: 2 for DP, 3 for
+        -- TP, 6 for vector.
+        --
+        -- QPRET lives in the VAC area at a fixed offset from
+        -- FIXLOC. CALL saves LOC+BANKSET there; RVQ restores.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    mpac_words: Integer = 7
+    dp_word_count: Integer = 2
+    tp_word_count: Integer = 3
+    vector_word_count: Integer = 6
+    vac_relative_threshold: Integer = 45
+    -- SQRT tolerance: the threshold is implicit in the CCS branching
+    -- structure at SQRTNEG. Roughly |MPAC| <= 1 in integer terms
+    -- (approximately 6×10^-5 in fractional scaling). Not a named
+    -- constant in the source.
+    sqrt_alarm_code: Integer = 1302
+    arccos_alarm_code: Integer = 1301
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Entry and resume ------------------------------------------------
+
+rule EnterInterpreter {
+    -- INTPRET: entry point from basic code. Releases interrupts,
+    -- saves Q as the interpretive program counter, captures bank
+    -- context, and enters the dispatch loop.
+    when: EnterInterpreter(entry_address, bank_context)
+
+    ensures:
+        interpreter.loc = entry_address
+        interpreter.bankset = bank_context
+        interpreter.edop = 0
+        FetchAndDispatch(interpreter: interpreter)
+
+    @guidance
+        -- RELINT releases interrupts. QXCH LOC saves the return
+        -- address (Q register) as the interpretive program counter.
+        -- BANKSET is loaded from BBANK. INTBIT15 is extracted from
+        -- bit 15 of FBANK. Then falls into NEWOPS.
+}
+
+rule ResumeInterpreter {
+    -- INTRSM: resume after a job swap. The Executive has already
+    -- saved and restored LOC. BBANK is restored from L (loaded
+    -- by CHANJOB), then enters INTPRET+3, skipping RELINT and
+    -- QXCH LOC.
+    when: ResumeInterpreter(bank_context)
+
+    ensures:
+        interpreter.bankset = bank_context
+        FetchAndDispatch(interpreter: interpreter)
+
+    @guidance
+        -- Called from ENDPRCHG in the Executive when dispatching
+        -- an interpretive job. L holds BANKSET from the core set
+        -- swap. INTRSM restores BBANK from L, then enters the
+        -- dispatch loop at INTPRET+3.
+}
+
+-- Dispatch loop ---------------------------------------------------
+
+rule Danzig {
+    -- DANZIG: main dispatch point, entered after most instructions.
+    -- Restores bank context, checks for pending second opcode,
+    -- checks for preemption, then fetches the next instruction.
+    when: Danzig(interpreter)
+
+    ensures:
+        interpreter.bankset = interpreter.bankset
+        if interpreter.edop != 0:
+            ExecuteOpcode(interpreter: interpreter, opcode: interpreter.edop)
+            interpreter.edop = 0
+        else:
+            if executive.new_job_pending:
+                YieldInterpretiveJob(job: executive.current_job)
+            else:
+                interpreter.loc = interpreter.loc + 1
+                FetchAndDispatch(interpreter: interpreter)
+
+    @guidance
+        -- Step 1: TS BANKSET restores BBANK so CHANJOB can save
+        -- it directly if preemption occurs.
+        -- Step 2: CCS EDOP. Non-zero means a second opcode from
+        -- the previous pair is waiting. CCS decrements EDOP,
+        -- consuming it. Jump to OPJUMP to execute.
+        -- Step 3: CCS NEWJOB. Positive means a higher-priority
+        -- job is waiting. Jump to CHANG2 (interpretive yield).
+        -- This is the ONLY cooperative preemption point for
+        -- interpretive code.
+        -- Step 4: Increment LOC and enter NEWOPS.
+}
+
+rule FetchAndDispatch {
+    -- NEWOPS: fetches the next word from the interpretive program
+    -- and decodes it as either an opcode pair or a store code.
+    when: FetchAndDispatch(interpreter)
+
+    ensures:
+        let word = fetch_word(interpreter.loc)
+        if word > 0:
+            ExecuteStore(interpreter: interpreter, store_code: word)
+        else:
+            let pair = decode_opcode_pair(word)
+            interpreter.edop = pair.left_opcode
+            ExecuteOpcode(interpreter: interpreter, opcode: pair.right_opcode)
+
+    @guidance
+        -- INDEX LOC / CA 0 fetches the word at C(LOC).
+        -- CCS A tests the sign:
+        -- Positive: store code, go to DOSTORE.
+        -- Negative: opcode pair. The diminished absolute value
+        -- from CCS goes to EDOP. MASK LOW7 extracts the right
+        -- opcode. The left opcode stays in EDOP for next cycle.
+        --
+        -- If the fetched word is exactly +0, CCS falls to the
+        -- +0 branch where LOW7 (OCT 177) sits. This is the same
+        -- dual-use constant/CCS-hole pattern as NO.CORES in the
+        -- Executive. An all-zeros opcode pair (both ops = EXIT)
+        -- would land here.
+}
+
+-- Opcode prefix decoding ------------------------------------------
+
+rule DecodeOpcodePrefix {
+    -- Classifies a 7-bit opcode by its prefix bits using CYR
+    -- (cycle-right register) to shift and test sequentially.
+    when: ExecuteOpcode(interpreter, opcode)
+
+    ensures:
+        let opclass = classify_opcode(opcode)
+        if opclass = address:
+            ResolveAddressAndExecute(interpreter: interpreter, opcode: opcode)
+        if opclass = misc:
+            ExecuteMisc(interpreter: interpreter, opcode: opcode)
+        if opclass = unary:
+            ExecuteUnary(interpreter: interpreter, opcode: opcode)
+        if opclass = short_shift:
+            ExecuteShortShift(interpreter: interpreter, opcode: opcode)
+
+    @guidance
+        -- The opcode is loaded into CYR, which rotates right on
+        -- each read. Three successive CCS CYR calls test prefix
+        -- bits 7, 6, 5:
+        --
+        -- First CCS: bit 7.
+        --   Positive: prefix 1x, go to OPJUMP2.
+        --   +0: EXIT (opcode 0000000).
+        --   Negative: prefix 0x, ADDRESS class. Needs operand.
+        --
+        -- OPJUMP2, second CCS: bit 6.
+        --   Positive: prefix 11, go to OPJUMP3.
+        --   +0: MISC class (prefix 10). Dispatch via MISCJUMP.
+        --
+        -- OPJUMP3, third CCS: bit 5.
+        --   Positive: UNARY class (prefix 111). Via UNAJUMP.
+        --   Negative/-0: SHORT SHIFT class (prefix 110).
+        --     MODE selects scalar vs vector shift routines.
+}
+
+-- Address resolution -----------------------------------------------
+
+rule ResolveDirectAddress {
+    -- Direct address: the next word in the instruction stream
+    -- contains the address.
+    when: ResolveAddressAndExecute(interpreter, opcode)
+
+    let next_word = fetch_word(interpreter.loc + 1)
+
+    requires: next_word >= 0
+
+    ensures:
+        interpreter.loc = interpreter.loc + 1
+        let address = resolve_direct(next_word, interpreter.fixloc, interpreter.intbit15)
+        DispatchAddressOp(interpreter: interpreter, opcode: opcode, operand_address: address)
+
+    @guidance
+        -- Addresses < 45D are VAC-relative: FIXLOC is added.
+        -- General erasable addresses (100-3777 octal) trigger
+        -- E-bank switching. Fixed memory addresses trigger F-bank
+        -- switching with INTBIT15.
+}
+
+rule ResolveIndexedAddress {
+    -- Indexed address: the address word (complemented in storage)
+    -- is augmented by an index register.
+    when: ResolveAddressAndExecute(interpreter, opcode)
+
+    let next_word = fetch_word(interpreter.loc + 1)
+
+    requires:
+        next_word >= 0
+        opcode_is_indexed(opcode)
+
+    ensures:
+        interpreter.loc = interpreter.loc + 1
+        let index_reg = select_index_register(next_word, interpreter.fixloc)
+        let address = resolve_indexed(next_word, index_reg, interpreter.fixloc, interpreter.intbit15)
+        DispatchAddressOp(interpreter: interpreter, opcode: opcode, operand_address: address)
+
+    @guidance
+        -- Bit 1 of the opcode signals indexing. The address word
+        -- is always present and complemented. Bit 2 of the stored
+        -- address selects X1 or X2. Index registers live in the
+        -- VAC area at FIXLOC + offset.
+}
+
+rule ResolvePushdownAddress {
+    -- Push-down (no address): the next word is negative (another
+    -- opcode pair or store code), so the operand comes from the
+    -- push-down list.
+    when: ResolveAddressAndExecute(interpreter, opcode)
+
+    let next_word = fetch_word(interpreter.loc + 1)
+
+    requires: next_word < 0
+
+    ensures:
+        let push_amount = push_decrement(interpreter.mode, opcode)
+        interpreter.pushloc = interpreter.pushloc - push_amount
+        DispatchAddressOp(interpreter: interpreter, opcode: opcode, operand_address: interpreter.pushloc)
+
+    @guidance
+        -- DIRADRES: INDEX LOC / CS 1 / CCS A. If the next word
+        -- is negative, it is an opcode pair (no address present).
+        -- The operand comes from the push-down list. PUSHLOC is
+        -- decremented by the mode-dependent word count:
+        -- DP = 2, TP = 3, vector = 6.
+        --
+        -- Exception: VXSC and V/SC want the opposite operand type
+        -- from MODE. The REVCNT table provides reversed push
+        -- decrements: if MODE is vector, they want scalar (2);
+        -- if MODE is DP, they want vector (6).
+}
+
+-- Store codes ------------------------------------------------------
+
+rule ExecuteStoreBasic {
+    -- STORE (type 00): store MPAC to the given address.
+    when: ExecuteStore(interpreter, store_code)
+
+    let decoded = decode_store(store_code)
+
+    requires: decoded.store_type = store
+
+    ensures:
+        store_mpac(decoded.address, interpreter.mode, interpreter.mpac)
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteStodl {
+    -- STODL (type 01): store MPAC, then reload in DP.
+    when: ExecuteStore(interpreter, store_code)
+
+    let decoded = decode_store(store_code)
+
+    requires: decoded.store_type = stodl
+
+    ensures:
+        store_mpac(decoded.address, interpreter.mode, interpreter.mpac)
+        interpreter.mode = double_precision
+        load_dp(interpreter: interpreter)
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteStovl {
+    -- STOVL (type 10): store MPAC, then reload a vector.
+    when: ExecuteStore(interpreter, store_code)
+
+    let decoded = decode_store(store_code)
+
+    requires: decoded.store_type = stovl
+
+    ensures:
+        store_mpac(decoded.address, interpreter.mode, interpreter.mpac)
+        interpreter.mode = vector
+        load_vector(interpreter: interpreter)
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteStcall {
+    -- STCALL (type 11): store MPAC, then perform a subroutine call.
+    when: ExecuteStore(interpreter, store_code)
+
+    let decoded = decode_store(store_code)
+
+    requires: decoded.store_type = stcall
+
+    ensures:
+        store_mpac(decoded.address, interpreter.mode, interpreter.mpac)
+        ExecuteCall(interpreter: interpreter)
+}
+
+-- Branching and control flow ---------------------------------------
+
+rule ExecuteGoto {
+    -- GOTO: unconditional branch. Loads new LOC and BANKSET.
+    when: ExecuteMisc(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `GOTO`
+
+    ensures:
+        let target = fetch_address(interpreter.loc + 1)
+        interpreter.loc = target.address
+        interpreter.bankset = target.bank
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteCall {
+    -- CALL: save return address in QPRET, then branch.
+    when: ExecuteMisc(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `CALL`
+
+    ensures:
+        interpreter.qpret = pack_return(interpreter.loc, interpreter.bankset)
+        let target = fetch_address(interpreter.loc + 1)
+        interpreter.loc = target.address
+        interpreter.bankset = target.bank
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteRvq {
+    -- RVQ: return via QPRET. Restores LOC and BANKSET from
+    -- the saved return address.
+    when: ExecuteUnary(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `RVQ`
+
+    ensures:
+        let return_addr = unpack_return(interpreter.qpret)
+        interpreter.loc = return_addr.address
+        interpreter.bankset = return_addr.bank
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteBze {
+    -- BZE: branch if MPAC = 0.
+    when: ExecuteMisc(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `BZE`
+
+    ensures:
+        if mpac_is_zero(interpreter.mpac, interpreter.mode):
+            let target = fetch_address(interpreter.loc + 1)
+            interpreter.loc = target.address
+            interpreter.bankset = target.bank
+        else:
+            interpreter.loc = interpreter.loc + 1
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteBpl {
+    -- BPL: branch if MPAC >= 0.
+    when: ExecuteMisc(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `BPL`
+
+    ensures:
+        if mpac_is_non_negative(interpreter.mpac):
+            let target = fetch_address(interpreter.loc + 1)
+            interpreter.loc = target.address
+            interpreter.bankset = target.bank
+        else:
+            interpreter.loc = interpreter.loc + 1
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteBmn {
+    -- BMN: branch if MPAC < 0.
+    when: ExecuteMisc(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `BMN`
+
+    ensures:
+        if mpac_is_negative(interpreter.mpac):
+            let target = fetch_address(interpreter.loc + 1)
+            interpreter.loc = target.address
+            interpreter.bankset = target.bank
+        else:
+            interpreter.loc = interpreter.loc + 1
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteBov {
+    -- BOV: branch on overflow. Tests OVFIND, branches to
+    -- interpretive address if set, clears OVFIND either way.
+    when: ExecuteMisc(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `BOV`
+
+    ensures:
+        if interpreter.ovfind:
+            let target = fetch_address(interpreter.loc + 1)
+            interpreter.loc = target.address
+            interpreter.bankset = target.bank
+        else:
+            interpreter.loc = interpreter.loc + 1
+        interpreter.ovfind = false
+        Danzig(interpreter: interpreter)
+}
+
+rule ExecuteRtb {
+    -- RTB: return to basic. Escapes to native AGC code at the
+    -- address following the RTB opcode. The basic routine returns
+    -- to DANZIG when done.
+    when: ExecuteMisc(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `RTB`
+
+    ensures:
+        let target = fetch_address(interpreter.loc + 1)
+        interpreter.loc = interpreter.loc + 1
+        EscapeToBasic(address: target.address, bank: target.bank)
+
+    @guidance
+        -- The basic routine is expected to return by branching
+        -- to DANZIG. This is the mechanism for calling native AGC
+        -- subroutines from interpretive code.
+}
+
+rule ExecuteCgoto {
+    -- CGOTO: computed goto. Indexes into a table of CADRs using
+    -- the low-order bits of MPAC.
+    when: ExecuteMisc(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `CGOTO`
+
+    ensures:
+        let table_base = fetch_address(interpreter.loc + 1)
+        let index = mpac_low_bits(interpreter.mpac)
+        let target = fetch_cadr_from_table(table_base, index)
+        interpreter.loc = target.address
+        interpreter.bankset = target.bank
+        Danzig(interpreter: interpreter)
+}
+
+-- EXIT -------------------------------------------------------------
+
+rule ExecuteExit {
+    -- EXIT (opcode 0000000): leaves the interpreter. Restores
+    -- BBANK from BANKSET and returns to basic code at C(LOC).
+    when: ExecuteOpcode(interpreter, opcode)
+
+    requires: opcode = 0
+
+    ensures:
+        interpreter.bankset = interpreter.bankset
+        ReturnToBasic(address: interpreter.loc)
+
+    @guidance
+        -- EXIT is detected early in prefix decoding: the first
+        -- CCS CYR falls to the +0 branch when the opcode is zero.
+        -- BBANK is restored from BANKSET before the TC to LOC.
+}
+
+-- Transcendental and special operations ----------------------------
+
+rule ExecuteSqrt {
+    -- SQRT: square root of MPAC. Small negative arguments
+    -- (magnitude < threshold) are treated as zero. Large negative
+    -- arguments trigger an abort.
+    when: ExecuteUnary(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `SQRT`
+
+    ensures:
+        if mpac_is_non_negative(interpreter.mpac):
+            interpreter.mpac = sqrt(interpreter.mpac)
+        else:
+            if mpac_magnitude_negligible(interpreter.mpac):
+                interpreter.mpac = zero_dp()
+            else:
+                SqrtAbort(interpreter: interpreter)
+        Danzig(interpreter: interpreter)
+
+    @guidance
+        -- The code first checks if the argument is merely a small
+        -- negative due to rounding (magnitude < 10^-4), in which
+        -- case it returns zero. Otherwise triggers POODOO with
+        -- alarm 1302.
+        --
+        -- CM/LM difference: Comanche does TC POODOO / OCT 1302.
+        -- Luminary does DXCH LOC / TC POODOO1 / OCT 1302, saving
+        -- LOC for better debug context.
+}
+
+rule SqrtAbort {
+    -- SQRT of a large negative number. Program alarm.
+    when: SqrtAbort(interpreter)
+
+    ensures: Bailout(alarm_code: config.sqrt_alarm_code)
+}
+
+rule ExecuteArccos {
+    -- ARCCOS: arc cosine of MPAC. Overflow triggers a non-fatal
+    -- alarm and returns zero, then continues execution.
+    when: ExecuteUnary(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `ARCCOS`
+
+    ensures:
+        if not arccos_overflow(interpreter.mpac):
+            interpreter.mpac = arccos(interpreter.mpac)
+        else:
+            RaiseAlarm(alarm_code: config.arccos_alarm_code)
+            interpreter.mpac = zero_dp()
+        Danzig(interpreter: interpreter)
+
+    @guidance
+        -- Unlike SQRT (which aborts via POODOO), ARCCOS handles
+        -- overflow gracefully: it calls ALARM (non-fatal, displays
+        -- alarm code but does not halt execution), forces the result
+        -- to zero, and returns to DANZIG to continue the interpretive
+        -- program.
+        --
+        -- CM/LM difference: Luminary saves LOC (EXTEND / DCA LOC)
+        -- before calling ALARM1. Comanche calls TC ALARM directly.
+}
+
+rule ExecuteUnit {
+    -- UNIT: compute unit vector from MPAC. Small vectors require
+    -- pre-normalization to avoid division overflow.
+    when: ExecuteUnary(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `UNIT`
+
+    ensures:
+        let result = unit_vector(interpreter.mpac)
+        interpreter.mpac = result.components
+        interpreter.mode = vector
+        Danzig(interpreter: interpreter)
+
+    @guidance
+        -- UNIT can overflow on very small vectors. The RT8
+        -- extension NORMUNIT handles this by checking whether all
+        -- upper-order halves are zero. If so, it shifts left 13
+        -- bits before calling UNIT. The magnitude returned in 36D
+        -- will be too large by 2^13 in this case. The caller must
+        -- account for this scaling.
+}
+
+-- Switch instructions ----------------------------------------------
+
+rule ExecuteSwitch {
+    -- SET, CLEAR, TEST and their combined forms operate on flag
+    -- bits. The operand encodes the switch word address and bit
+    -- position.
+    when: ExecuteMisc(interpreter, opcode)
+
+    requires: opcode_mnemonic(opcode) = `SW`
+
+    ensures:
+        let switch_op = decode_switch(opcode, interpreter.loc)
+        ApplySwitch(interpreter: interpreter, operation: switch_op)
+        Danzig(interpreter: interpreter)
+
+    @guidance
+        -- The operand encodes both the switch word address and
+        -- the bit position within that word. SET sets the bit,
+        -- CLEAR clears it, TEST tests and optionally branches.
+        -- Combined forms: SETGO, CLRGO branch after the operation.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant MpacDpSignExtension {
+    -- In double-precision mode, MPAC+2 must be zero (sign extension).
+    -- DP operations use only MPAC+0 and MPAC+1. MPAC+2 is cleared
+    -- to propagate the sign correctly into triple-precision contexts.
+    interpreter.mode = double_precision implies interpreter.mpac_sign_extension = 0
+}
+
+invariant MpacSize {
+    -- MPAC is always exactly 7 words.
+    interpreter.mpac.count = config.mpac_words
+}
+
+invariant PushlocWithinVacArea {
+    -- PUSHLOC must remain within the VAC area bounds.
+    interpreter.pushloc >= interpreter.fixloc
+}
+
+invariant ModeConsistency {
+    -- MODE determines how much data operations read and write.
+    -- After any load or arithmetic operation, the amount of valid
+    -- data in MPAC must match the current MODE.
+    interpreter.mode = double_precision implies valid_dp_mpac(interpreter.mpac)
+    interpreter.mode = triple_precision implies valid_tp_mpac(interpreter.mpac)
+    interpreter.mode = vector implies valid_vector_mpac(interpreter.mpac)
+}
+
+------------------------------------------------------------
+-- Implementation notes
+------------------------------------------------------------
+
+-- CYR prefix decoding
+--
+-- The 7-bit opcode is loaded into CYR, a hardware register that
+-- rotates its contents right by one bit on each READ. Each CCS CYR
+-- in the prefix decoding chain shifts and tests the next prefix bit
+-- without explicit shift instructions. Three reads classify the
+-- opcode into one of four classes by testing bits 7, 6, 5 in
+-- sequence. This is among the most elegant uses of the AGC's
+-- I/O-mapped edit registers.
+
+-- LOW7 dual-use constant
+--
+-- LOW7 (OCT 177) occupies the +0 branch of CCS A in NEWOPS. Same
+-- dual-use constant/CCS-hole pattern as NO.CORES in the Executive.
+-- If the fetched word were exactly +0 (an empty opcode pair with
+-- both opcodes = EXIT), CCS would fall to this position. LOW7
+-- serves as both a mask constant and a structural guard.
+
+-- Opcode pair CCS trick
+--
+-- CCS simultaneously tests the sign of the fetched word and extracts
+-- the diminished absolute value. For negative words (opcode pairs),
+-- the diminished value becomes EDOP. Because CCS decrements by 1,
+-- the second opcode in EDOP is off by one. The OPJUMP entry point
+-- adds 1 back. This triple-duty use of a single CCS is characteristic
+-- of the AGC's instruction-efficient style.
+
+-- INTBIT15 bank restriction
+--
+-- Programs in high banks (bit 15 of FBANK = 1) cannot reference
+-- low banks, and vice versa. The interpreter does NOT switch
+-- superbanks. This is a hard constraint on how interpretive programs
+-- are laid out in memory. All interpretive code and its operands
+-- must reside within the same superbank region.
+
+-- REVCNT reverse push
+--
+-- VXSC and V/SC need the opposite operand type from what MODE
+-- indicates. If the last result was a vector (MODE = -1), VXSC
+-- wants a scalar from the push-down list (decrement 2). If the
+-- last result was scalar (MODE = 0), it wants a vector (decrement
+-- 6). The REVCNT table provides these reversed decrements, indexed
+-- by the same MODE offset used for the normal PUSHLOC table but
+-- with swapped values.
+
+-- Cooperative preemption granularity
+--
+-- The NEWJOB check in DANZIG is the ONLY cooperative preemption
+-- point for interpretive code. Between two interpretive instructions,
+-- the interpreter checks NEWJOB and yields via CHANG2 if a higher-
+-- priority job is waiting. Long-running interpretive instructions
+-- (matrix operations, transcendental functions) cannot be preempted
+-- mid-execution. The worst-case preemption latency for interpretive
+-- code is the duration of the longest single interpretive instruction.
+
+-- CM/LM differences
+--
+-- The interpreter is shared code between Comanche (CM) and Luminary
+-- (LM). The only substantive differences are in abort handling:
+-- Luminary saves LOC via DXCH before calling POODOO1, providing
+-- better debug context. Comanche calls POODOO directly. This
+-- affects SQRT (alarm 1302) and ARCCOS (alarm 1301). COUNT directive
+-- syntax also differs (fixed vs switchable bank) but this has no
+-- behavioural impact.
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Black box functions used in rules:
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Interpreter.fetch_word    -- see: Comanche055/INTERPRETER.agc, Luminary099/INTERPRETER.agc
+    -- INDEX LOC / CA 0. Fetches the word at the address in LOC
+    -- with current bank context.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Interpreter.decode_opcode_pair    -- see: Comanche055/INTERPRETER.agc, Luminary099/INTERPRETER.agc
+    -- Extracts right opcode (LOW7 mask) and left opcode (remaining
+    -- bits after CCS diminish) from a negative opcode word.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Interpreter.classify_opcode    -- see: Comanche055/INTERPRETER.agc, Luminary099/INTERPRETER.agc
+    -- Three-stage CYR prefix decode. Returns the opcode class
+    -- (address, misc, unary, short_shift).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Interpreter.resolve_direct    -- see: Comanche055/INTERPRETER.agc, Luminary099/INTERPRETER.agc
+    -- Direct address resolution. VAC-relative for addresses < 45D,
+    -- E-bank switch for general erasable, F-bank switch for fixed.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Interpreter.resolve_indexed    -- see: Comanche055/INTERPRETER.agc, Luminary099/INTERPRETER.agc
+    -- Indexed address resolution. Augments the address word by
+    -- the contents of X1 or X2 (selected by bit 2).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Interpreter.push_decrement    -- see: Comanche055/INTERPRETER.agc, Luminary099/INTERPRETER.agc
+    -- Returns the push-down decrement for the current MODE and
+    -- opcode. Uses REVCNT for VXSC/V/SC.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Interpreter.decode_store    -- see: Comanche055/INTERPRETER.agc, Luminary099/INTERPRETER.agc
+    -- Extracts store type, address and indexing from a positive
+    -- store code word.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Interpreter.store_mpac    -- see: Comanche055/INTERPRETER.agc, Luminary099/INTERPRETER.agc
+    -- Stores MPAC contents to the given address. Word count
+    -- depends on MODE.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Interpreter.unit_vector    -- see: Comanche055/INTERPRETER.agc, Luminary099/INTERPRETER.agc
+    -- Computes unit vector with NORMUNIT pre-normalization for
+    -- small vectors. Returns components and magnitude in 36D.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+open question "Opcode 35 (octal) in the address class is listed as 'available' in the INDJUMP table. The entry at that position is 'TCF' with no target (Comanche055 line 334). If reached, this would execute whatever instruction follows the incomplete TCF. Whether yaYUL assembles this as a no-op, a trap, or an undefined jump is unclear from the source alone. Can interpretive programs ever generate this opcode?"
+
+open question "What happens if PUSHLOC underflows below FIXLOC? The interpreter decrements PUSHLOC by 2, 3 or 6 words depending on MODE, but there is no bounds check. If interpretive code pushes more data than the VAC area can hold, PUSHLOC will point below the VAC area base and subsequent stores will corrupt adjacent memory. Is this a known constraint that callers must respect, or is it a latent bug?"
+
+open question "INTBIT15 prevents cross-superbank references from interpretive code. Are there any known cases where interpretive programs need to reference data or code across the superbank boundary? If so, how is this handled — does the program EXIT to basic code, perform the cross-bank operation, then re-enter the interpreter?"

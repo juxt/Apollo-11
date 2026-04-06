@@ -1,0 +1,807 @@
+-- allium: 3
+-- Apollo Guidance Computer — Service programs
+-- P11, P40–P47, R60/R62, SERVICER207, powered flight subroutines, S-band antenna
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    servicer: ServicerState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ThrustProgram { p40_sps | p41_rcs | p42_aps | p47_monitor }
+
+enum BurnPhase { pre_burn | ullage | ignition | thrusting | tailoff | shutdown | complete }
+
+enum EngineType { sps | rcs | aps }
+
+enum ManoeuvreStatus { idle | commanding | in_progress | complete }
+
+enum AntennaMode { auto | manual }
+
+enum ServicerMode { off | running | averaging }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value BurnParameters {
+    -- Burn target from the targeting program (P30/P31/P34/etc.)
+    delta_v_desired: List<Decimal>
+    ignition_time: Decimal
+    engine: EngineType
+    ullage_duration_cs: Integer
+
+    @guidance
+        -- Loaded by the targeting programs into the DELVSLV/DELVLVC
+        -- registers. The desired delta-V is in local vertical
+        -- coordinates. TIG (time of ignition) is stored in TTOGO
+        -- and displayed as V06N33.
+}
+
+value AccumulatedDeltaV {
+    -- Integrated delta-V from PIPA readings
+    x: Decimal
+    y: Decimal
+    z: Decimal
+    magnitude: Decimal
+
+    @guidance
+        -- SERVICER207 reads the PIPAs every 2 seconds during
+        -- powered flight and accumulates the measured delta-V.
+        -- The magnitude is compared against the desired delta-V
+        -- to determine when to cut off the engine.
+}
+
+value AttitudeTarget {
+    -- Desired FDAI ball angles for a manoeuvre
+    roll: Decimal
+    pitch: Decimal
+    yaw: Decimal
+}
+
+value AntennaAngles {
+    -- S-band antenna pitch and yaw pointing angles
+    pitch: Decimal
+    yaw: Decimal
+
+    @guidance
+        -- Computed from the CSM state vector and the current
+        -- ground station position. Displayed as V16N51 for
+        -- crew reference or used to drive the antenna auto-track.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity ServicerState {
+    -- SERVICER207: powered flight navigation for the CM
+    mode: ServicerMode
+    accumulated_dv: AccumulatedDeltaV?
+    gravity_vector: List<Decimal>?
+    cycle_count: Integer
+
+    -- PIPA reading state
+    pipas_valid: Boolean
+
+    -- Restart protection (group 4 for powered flight)
+    restart_group: Integer
+
+    @guidance
+        -- SERVICER207 is the Comanche version of the SERVICER
+        -- routine. It runs as a T4RUPT-triggered task every 2
+        -- seconds during powered flight. Each cycle: read PIPAs,
+        -- compensate for NBDI and ADIA errors, compute gravity,
+        -- integrate the state vector (via Encke's method from
+        -- navigation.allium), and accumulate delta-V.
+        --
+        -- The AVERAGEG flag (FLAGWRD1 bit 1) controls whether
+        -- SERVICER is active. Set by P40/P41 before ignition,
+        -- cleared at shutdown.
+}
+
+entity BurnManager {
+    -- Manages an SPS, RCS or APS burn sequence
+    program: ThrustProgram
+    phase: BurnPhase
+    engine: EngineType
+    parameters: BurnParameters
+    accumulated_dv: AccumulatedDeltaV?
+    time_to_ignition: Decimal?
+
+    -- Cross-product steering state
+    steering_active: Boolean
+    gimbal_angles: AttitudeTarget?
+
+    -- Restart protection phase counter
+    burn_phase_counter: Integer
+
+    transitions phase {
+        pre_burn -> ullage
+        ullage -> ignition
+        ignition -> thrusting
+        thrusting -> tailoff
+        thrusting -> shutdown
+        tailoff -> shutdown
+        shutdown -> complete
+        terminal: complete
+    }
+
+    @guidance
+        -- P40 (SPS) is the primary burn manager. It coordinates:
+        -- 1. Pre-burn attitude manoeuvre (via R60)
+        -- 2. Ullage (RCS translation to settle propellant)
+        -- 3. Master ignition (via ENGONBIT, channel 11 bit 13)
+        -- 4. Cross-product steering during the burn
+        -- 5. Shutdown at accumulated delta-V cutoff
+        --
+        -- P41 (RCS) follows the same structure but uses RCS
+        -- translation jets and has no TVC DAP interaction.
+        --
+        -- P42 (APS) manages ascent engine burns for the docked
+        -- LM case. The program logic exists in Comanche for
+        -- contingency use.
+        --
+        -- Restart protection uses group 4 with phases encoding
+        -- the burn sequence state. PHASCHNG calls bracket each
+        -- critical transition.
+}
+
+entity AttitudeManoeuvre {
+    -- R60/R62: attitude manoeuvre execution and display
+    status: ManoeuvreStatus
+    target: AttitudeTarget
+    current: AttitudeTarget?
+    error_tolerance_deg: Decimal
+
+    -- Requesting program (P40, P41, etc.)
+    requestor: ThrustProgram?
+
+    transitions status {
+        idle -> commanding
+        commanding -> in_progress
+        in_progress -> complete
+        complete -> idle
+        terminal: idle
+    }
+
+    @guidance
+        -- R60 commands an attitude manoeuvre by computing the
+        -- rotation from current to desired gimbal angles and
+        -- commanding the RCS DAP (or manual FDAI needles).
+        -- R62 displays the manoeuvre progress as FDAI attitude
+        -- errors.
+        --
+        -- Called by burn programs to achieve the burn attitude
+        -- before ignition. Also used standalone by V49 (crew
+        -- attitude manoeuvre request).
+        --
+        -- The manoeuvre is complete when all three axis errors
+        -- are within the error tolerance. R60 uses V50N18 to
+        -- display target angles, then R62 monitors with V16N18.
+}
+
+entity EarthOrbitMonitor {
+    -- P11: monitors powered ascent to Earth orbit
+    altitude: Decimal
+    velocity: Decimal
+    flight_path_angle: Decimal
+    active: Boolean
+
+    @guidance
+        -- P11 runs during Saturn powered ascent. It reads the
+        -- state vector (integrated by SERVICER207) and displays
+        -- V06N62: altitude, velocity and flight path angle.
+        -- The crew monitors for proper trajectory. P11 does not
+        -- issue guidance commands; it is purely a display program.
+        --
+        -- Terminated at orbit insertion (when the IU signals
+        -- separation) and the crew transitions to P00 or the
+        -- next mission program.
+}
+
+entity ThrustMonitor {
+    -- P47: displays accumulated delta-V during any powered flight
+    accumulated_dv: AccumulatedDeltaV
+    active: Boolean
+
+    @guidance
+        -- P47 is a passive monitoring program that can run
+        -- alongside P40/P41/P42. Displays V06N40: accumulated
+        -- delta-V components (X, Y, Z). The crew uses this for
+        -- cross-checking the primary burn program's cutoff logic.
+}
+
+entity SbandAntenna {
+    -- S-band antenna pointing computer
+    angles: AntennaAngles
+    mode: AntennaMode
+    ground_station_known: Boolean
+    update_interval_cs: Integer
+
+    @guidance
+        -- Computes pitch and yaw angles for the CM S-band
+        -- high-gain antenna to maintain lock on the active
+        -- ground station (MSFN). Runs as a periodic routine
+        -- called by the DSKY extended verb V64.
+        --
+        -- The computation uses the CSM state vector, the
+        -- current time, and the ground station position
+        -- (selected by the crew via DSKY). Displays V16N51
+        -- showing the two pointing angles.
+        --
+        -- Critical for maintaining ground communication during
+        -- manoeuvres when the omnidirectional antenna has
+        -- insufficient gain.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- SERVICER timing
+    servicer_cycle_period_cs: Integer = 200
+
+    -- Burn timing
+    default_ullage_duration_cs: Integer = 1700
+    sps_tailoff_duration_cs: Integer = 50
+
+    -- Cross-product steering
+    steering_gain: Decimal = 1.0
+
+    -- R60 attitude tolerance
+    manoeuvre_tolerance_deg: Decimal = 0.5
+
+    -- S-band update rate
+    sband_update_interval_cs: Integer = 1500
+
+    -- Restart groups
+    powered_flight_restart_group: Integer = 4
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- P11: Earth orbit insertion monitor ---------------------------
+
+rule P11Start {
+    -- Activated during powered ascent to orbit.
+    when: StartProgram(program: p11)
+
+    ensures:
+        let monitor = EarthOrbitMonitor.created(
+            altitude: 0,
+            velocity: 0,
+            flight_path_angle: 0,
+            active: true
+        )
+        DisplayDsky(verb: 6, noun: 62)
+
+    @guidance
+        -- P11 is the default program during Saturn powered flight.
+        -- V06N62 displays altitude (N62 R1), inertial velocity
+        -- (N62 R2) and flight path angle (N62 R3). Updated each
+        -- SERVICER cycle (every 2 seconds).
+}
+
+rule P11Update {
+    -- SERVICER cycle updates the displayed trajectory parameters.
+    when: ServicerCycleComplete(monitor)
+
+    requires: monitor.active = true
+
+    ensures:
+        monitor.altitude = current_altitude()
+        monitor.velocity = current_velocity()
+        monitor.flight_path_angle = current_fpa()
+        DisplayDsky(verb: 6, noun: 62)
+}
+
+-- P40: SPS thrusting -------------------------------------------
+
+rule P40Start {
+    -- Initiates SPS burn sequence.
+    when: StartProgram(program: p40)
+
+    let params = load_burn_parameters()
+
+    requires: params.engine = sps
+
+    ensures:
+        let burn = BurnManager.created(
+            program: p40_sps,
+            phase: pre_burn,
+            engine: sps,
+            parameters: params,
+            accumulated_dv: null,
+            time_to_ignition: params.ignition_time - current_time(),
+            steering_active: false,
+            gimbal_angles: null,
+            burn_phase_counter: 0
+        )
+        StartServicer()
+        RequestAttitudeManoeuvre(target: compute_burn_attitude(params))
+        DisplayDsky(verb: 6, noun: 33)
+
+    @guidance
+        -- P40 is entered via V37E40E. It loads the burn parameters
+        -- from the targeting solution (computed by P30, P31 or P34),
+        -- starts SERVICER207 for delta-V accumulation, requests
+        -- the burn attitude via R60, and displays V06N33 (TIG).
+        --
+        -- The sequence: R60 manoeuvre -> V99 PLEASE PERFORM (ullage)
+        -- -> PRO -> IGNITION -> cross-product steering -> cutoff.
+        --
+        -- P40 coordinates with the TVC DAP (cm_autopilots.allium).
+        -- DOTVCON activates the TVC DAP at ignition. TVCDAPON
+        -- initialises the pitch/yaw loops and the roll DAP.
+}
+
+rule P40Ullage {
+    -- Ullage phase: RCS translation to settle propellant before ignition.
+    when: UllageStart(burn)
+
+    requires:
+        burn.program = p40_sps
+        burn.phase = pre_burn
+
+    ensures:
+        burn.phase = ullage
+        CommandRcsUllage(duration: burn.parameters.ullage_duration_cs)
+        burn.burn_phase_counter = burn.burn_phase_counter + 1
+
+    @guidance
+        -- Ullage uses +X RCS jets to provide forward acceleration,
+        -- settling SPS propellant against the tank outlet. Default
+        -- duration is 17 seconds (pad-loadable). Commanded via
+        -- channel 5/6 jet commands.
+}
+
+rule P40Ignition {
+    -- Master ignition: SPS engine on.
+    when: IgnitionTime(burn)
+
+    requires:
+        burn.program = p40_sps
+        burn.phase = ullage
+
+    ensures:
+        burn.phase = ignition
+        CommandEngineOn(engine: sps)
+        ActivateTvcDap()
+        burn.burn_phase_counter = burn.burn_phase_counter + 1
+
+    @guidance
+        -- Engine on is commanded via ENGONBIT (channel 11 bit 13).
+        -- The TVC DAP is activated simultaneously to maintain
+        -- attitude during the burn. The master ignition routine
+        -- (ENGINOF1/ENGINON1) handles the sequencing.
+        --
+        -- PHASCHNG records the ignition phase for restart protection.
+        -- If a GOJAM occurs during the burn, GOPROG can restart
+        -- with the engine already running.
+}
+
+rule P40Thrusting {
+    -- Cross-product steering active during the burn.
+    when: burn: BurnManager.phase transitions_to thrusting
+
+    requires: burn.program = p40_sps
+
+    ensures:
+        burn.steering_active = true
+        burn.gimbal_angles = compute_steering_angles(burn.parameters, burn.accumulated_dv)
+
+    @guidance
+        -- Cross-product steering (from POWERED_FLIGHT_SUBROUTINES)
+        -- computes the angular error between the desired thrust
+        -- direction and the actual thrust direction, using the
+        -- cross product of the desired and actual delta-V unit
+        -- vectors. The result drives the TVC DAP's attitude
+        -- error inputs.
+        --
+        -- Steering updates run every SERVICER cycle (2 seconds).
+        -- Lambert targeting (also in POWERED_FLIGHT_SUBROUTINES)
+        -- may recompute the desired delta-V direction during
+        -- long burns.
+}
+
+rule P40Shutdown {
+    -- Engine cutoff when accumulated delta-V reaches the target.
+    when: DeltaVCutoff(burn)
+
+    requires:
+        burn.program = p40_sps
+        burn.phase = thrusting
+
+    ensures:
+        burn.phase = shutdown
+        CommandEngineOff(engine: sps)
+        burn.steering_active = false
+        StopServicer()
+        burn.burn_phase_counter = burn.burn_phase_counter + 1
+
+    @guidance
+        -- Cutoff is triggered when the magnitude of accumulated
+        -- delta-V (from SERVICER207) reaches or exceeds the
+        -- desired delta-V magnitude. The engine-off command is
+        -- issued via ENGOFBIT (channel 11 bit 13 cleared).
+        --
+        -- After shutdown, a brief tailoff period accounts for
+        -- residual thrust. SERVICER continues accumulating
+        -- delta-V through tailoff to capture the total impulse.
+}
+
+rule P40Complete {
+    when: burn: BurnManager.phase transitions_to complete
+
+    requires: burn.program = p40_sps
+
+    ensures:
+        DeactivateTvcDap()
+        DisplayDsky(verb: 6, noun: 40)
+
+    @guidance
+        -- V06N40 displays the final delta-V residuals after
+        -- the burn. The crew can trim residuals using P41 (RCS)
+        -- if needed. The TVC DAP is deactivated and the DAP
+        -- returns to RCS mode.
+}
+
+-- P41: RCS thrusting -------------------------------------------
+
+rule P41Start {
+    when: StartProgram(program: p41)
+
+    let params = load_burn_parameters()
+
+    requires: params.engine = rcs
+
+    ensures:
+        let burn = BurnManager.created(
+            program: p41_rcs,
+            phase: pre_burn,
+            engine: rcs,
+            parameters: params,
+            accumulated_dv: null,
+            time_to_ignition: params.ignition_time - current_time(),
+            steering_active: false,
+            gimbal_angles: null,
+            burn_phase_counter: 0
+        )
+        StartServicer()
+        RequestAttitudeManoeuvre(target: compute_burn_attitude(params))
+        DisplayDsky(verb: 6, noun: 33)
+
+    @guidance
+        -- P41 manages RCS translation burns. Same structure as P40
+        -- but uses RCS +X jets for thrust. No TVC DAP interaction.
+        -- Typically used for small delta-V corrections or residual
+        -- trimming after an SPS burn.
+}
+
+rule P41Thrusting {
+    when: burn: BurnManager.phase transitions_to thrusting
+
+    requires: burn.program = p41_rcs
+
+    ensures:
+        burn.steering_active = true
+        CommandRcsTranslation(direction: burn.parameters.delta_v_desired)
+}
+
+rule P41Shutdown {
+    when: DeltaVCutoff(burn)
+
+    requires:
+        burn.program = p41_rcs
+        burn.phase = thrusting
+
+    ensures:
+        burn.phase = shutdown
+        CommandRcsOff()
+        burn.steering_active = false
+        StopServicer()
+}
+
+-- P42: APS thrusting -------------------------------------------
+
+rule P42Start {
+    -- APS burn for docked LM contingency.
+    when: StartProgram(program: p42)
+
+    let params = load_burn_parameters()
+
+    requires: params.engine = aps
+
+    ensures:
+        let burn = BurnManager.created(
+            program: p42_aps,
+            phase: pre_burn,
+            engine: aps,
+            parameters: params,
+            accumulated_dv: null,
+            time_to_ignition: params.ignition_time - current_time(),
+            steering_active: false,
+            gimbal_angles: null,
+            burn_phase_counter: 0
+        )
+        StartServicer()
+        RequestAttitudeManoeuvre(target: compute_burn_attitude(params))
+
+    @guidance
+        -- P42 exists in Comanche for the contingency case where
+        -- the docked LM ascent engine is used for propulsion
+        -- (e.g. Apollo 13 scenario). The burn sequence follows
+        -- the same pattern as P40 but commanding the APS engine
+        -- through the LM interface.
+}
+
+-- P47: Thrust monitor ------------------------------------------
+
+rule P47Start {
+    -- Passive delta-V monitoring, can run alongside P40/P41/P42.
+    when: StartProgram(program: p47)
+
+    ensures:
+        let monitor = ThrustMonitor.created(
+            accumulated_dv: AccumulatedDeltaV.created(x: 0, y: 0, z: 0, magnitude: 0),
+            active: true
+        )
+        DisplayDsky(verb: 6, noun: 40)
+
+    @guidance
+        -- P47 displays V06N40 (accumulated delta-V) for crew
+        -- monitoring. Independent of the burn control programs,
+        -- providing a cross-check. Updated each SERVICER cycle.
+}
+
+-- SERVICER207: powered flight navigation -----------------------
+
+rule ServicerCycle {
+    -- Core SERVICER loop: read PIPAs, integrate state, accumulate delta-V.
+    when: ServicerTick()
+
+    requires: servicer.mode = running
+
+    ensures:
+        ReadPipas()
+        servicer.accumulated_dv = integrate_pipa_readings(servicer.accumulated_dv)
+        servicer.gravity_vector = compute_gravity()
+        IntegrateStateVector()
+        servicer.cycle_count = servicer.cycle_count + 1
+        ScheduleTask(task: ServicerTick, delay: config.servicer_cycle_period_cs)
+
+    @guidance
+        -- SERVICER207 runs every 2 seconds (100 cs period in the
+        -- source, doubled for the CM version). Each cycle:
+        -- 1. Read PIPAs (pulsed integrating pendulous accelerometers)
+        -- 2. Compensate for NBDI (null bias drift) and ADIA
+        --    (acceleration-dependent) errors using pad-loaded
+        --    compensation coefficients
+        -- 3. Compute gravitational acceleration at current position
+        -- 4. Integrate the state vector via INTEGRVS (Encke's
+        --    method, specified in navigation.allium)
+        -- 5. Accumulate measured delta-V
+        --
+        -- Restart protection: group 4 variable phase. PHASCHNG
+        -- saves SERVICER state so a GOJAM mid-cycle can resume
+        -- from the correct point. PIPASR (PIPA read) must
+        -- complete atomically to avoid losing counts.
+}
+
+rule StartServicer {
+    when: StartServicer()
+
+    requires: servicer.mode = off
+
+    ensures:
+        servicer.mode = running
+        servicer.accumulated_dv = AccumulatedDeltaV.created(x: 0, y: 0, z: 0, magnitude: 0)
+        servicer.cycle_count = 0
+        servicer.pipas_valid = true
+        servicer.restart_group = config.powered_flight_restart_group
+        ScheduleTask(task: ServicerTick, delay: config.servicer_cycle_period_cs)
+}
+
+rule StopServicer {
+    when: StopServicer()
+
+    requires: servicer.mode = running
+
+    ensures:
+        servicer.mode = off
+        servicer.pipas_valid = false
+}
+
+-- R60/R62: Attitude manoeuvre ----------------------------------
+
+rule R60CommandManoeuvre {
+    -- R60: commands an attitude manoeuvre to the target angles.
+    when: RequestAttitudeManoeuvre(target)
+
+    let manoeuvre = find_or_create_manoeuvre()
+
+    ensures:
+        manoeuvre.status = commanding
+        manoeuvre.target = target
+        DisplayDsky(verb: 50, noun: 18)
+        CommandAttitude(target: target)
+
+    @guidance
+        -- R60 computes the shortest rotation path from current
+        -- gimbal angles to the target. V50N18 displays the target
+        -- angles for crew awareness. The RCS DAP executes the
+        -- manoeuvre using body-axis rate commands.
+        --
+        -- If STESSION flag is set, R60 performs a 3-axis
+        -- simultaneous manoeuvre. Otherwise it commands single-axis
+        -- rotations sequentially (roll, then pitch, then yaw).
+}
+
+rule R62MonitorManoeuvre {
+    -- R62: monitors manoeuvre progress, displays attitude errors.
+    when: manoeuvre: AttitudeManoeuvre.status transitions_to in_progress
+
+    ensures:
+        manoeuvre.current = read_current_attitude()
+        DisplayDsky(verb: 16, noun: 18)
+
+    @guidance
+        -- R62 updates the FDAI attitude error needles and displays
+        -- V16N18 (current gimbal angles). The manoeuvre is complete
+        -- when all three axes are within the configured tolerance.
+}
+
+rule R60ManoeuvreComplete {
+    when: AttitudeWithinTolerance(manoeuvre)
+
+    requires: manoeuvre.status = in_progress
+
+    ensures:
+        manoeuvre.status = complete
+
+    @guidance
+        -- Completion is determined by comparing the attitude error
+        -- magnitude against config.manoeuvre_tolerance_deg in each
+        -- axis. The requesting program is notified via a flag or
+        -- job wake.
+}
+
+-- S-band antenna pointing --------------------------------------
+
+rule SbandCompute {
+    -- Computes antenna pointing angles to track the active ground station.
+    when: SbandUpdateTick(antenna)
+
+    requires: antenna.ground_station_known = true
+
+    ensures:
+        antenna.angles = compute_antenna_angles(antenna)
+        DisplayDsky(verb: 16, noun: 51)
+        ScheduleTask(task: SbandUpdateTick, delay: config.sband_update_interval_cs)
+
+    @guidance
+        -- The computation uses the CSM state vector (from
+        -- navigation.allium), the ground station geodetic
+        -- coordinates, Earth rotation, and the current CM
+        -- body attitude to produce antenna pitch and yaw
+        -- angles in the antenna coordinate frame.
+        --
+        -- V16N51 displays pitch (R1) and yaw (R2) angles
+        -- for manual pointing, or the angles drive the auto-
+        -- track servo if in auto mode.
+        --
+        -- Activated by extended verb V64. Runs periodically
+        -- (every 15 seconds) until terminated. Uses group 2
+        -- restart protection.
+}
+
+rule SbandStart {
+    when: StartSbandPointing(station)
+
+    ensures:
+        let antenna = SbandAntenna.created(
+            angles: AntennaAngles.created(pitch: 0, yaw: 0),
+            mode: auto,
+            ground_station_known: true,
+            update_interval_cs: config.sband_update_interval_cs
+        )
+        ScheduleTask(task: SbandUpdateTick, delay: 0)
+
+    @guidance
+        -- Initiated by V64E. The crew selects the ground station
+        -- number via DSKY. Station coordinates are stored in a
+        -- fixed table in the AGC rope.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant SingleActiveBurn {
+    -- At most one burn is in progress at a time.
+    for a in BurnManagers:
+        for b in BurnManagers:
+            a != b implies not (a.phase != pre_burn and a.phase != complete
+                and b.phase != pre_burn and b.phase != complete)
+}
+
+invariant ServicerRunningDuringBurn {
+    -- SERVICER must be running whenever a burn is in progress.
+    for burn in BurnManagers:
+        (burn.phase = thrusting or burn.phase = ullage or burn.phase = ignition)
+            implies servicer.mode = running
+}
+
+invariant BurnSequenceOrder {
+    -- Burn phases progress in the defined sequence only.
+    -- Enforced by the transitions block on BurnManager.phase.
+    for burn in BurnManagers:
+        burn.phase = thrusting implies burn.burn_phase_counter > 0
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ServicerState.ReadPipas    -- see: Comanche055/SERVICER207.agc
+    -- Reads pulsed integrating pendulous accelerometer counters.
+    -- Must be atomic (interrupts inhibited) to avoid losing counts.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ServicerState.integrate_pipa_readings    -- see: Comanche055/SERVICER207.agc
+    -- Compensates PIPA readings for NBDI and ADIA errors, then
+    -- accumulates into the delta-V registers.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ServicerState.compute_gravity    -- see: Comanche055/SERVICER207.agc
+    -- Computes gravitational acceleration vector at the current
+    -- position for state vector integration.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred ServicerState.IntegrateStateVector    -- see: navigation.allium (IntegrationState)
+    -- Calls INTEGRVS to propagate the state vector using
+    -- Encke's method with accumulated delta-V as the perturbation.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred BurnManager.compute_burn_attitude    -- see: Comanche055/P40-P47.agc
+    -- Computes the desired gimbal angles for the burn attitude
+    -- from the targeting solution's delta-V direction.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred BurnManager.compute_steering_angles    -- see: Comanche055/POWERED_FLIGHT_SUBROUTINES.agc
+    -- Cross-product steering: computes angular error between
+    -- desired and actual thrust direction. Returns gimbal angle
+    -- corrections for the TVC DAP.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred BurnManager.load_burn_parameters    -- see: Comanche055/P40-P47.agc
+    -- Loads burn parameters from the targeting solution stored
+    -- in erasable memory by P30/P31/P34.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred SbandAntenna.compute_antenna_angles    -- see: Comanche055/S-BAND_ANTENNA_FOR_CM.agc
+    -- Transforms from inertial frame to antenna body frame
+    -- using the current state vector and ground station coordinates.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "P40 coordinates with the TVC DAP via DOTVCON/TVCDAPON. The exact handshake timing between P40's ignition command and the TVC DAP's first control cycle is not fully clear. Does the TVC DAP complete initialisation before or after the engine-on command? A race condition here could cause a brief uncontrolled thrust transient."
+
+open question "SERVICER207's 2-second cycle period differs from the LM SERVICER's 1-second period. The CM version runs at half rate because the CM's computational load is different (no landing radar, different guidance equations). Is the 2-second period ever dynamically adjusted, or is it fixed for all CM powered flight phases?"
+
+open question "P42 (APS thrusting) exists in Comanche but was not used during Apollo 11. Its interaction with the LM interface for engine commanding in the docked configuration is not well documented in the Comanche source. The Apollo 13 contingency demonstrated this capability but used Luminary, not Comanche."
+
+open question "R60's manoeuvre strategy (simultaneous 3-axis vs sequential single-axis) depends on the STESSION flag. What sets this flag? Is it crew-selectable or determined by the requesting program? The source comments are ambiguous."

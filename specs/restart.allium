@@ -1,0 +1,921 @@
+-- allium: 3
+-- Apollo Guidance Computer — Restart and fault-tolerance subsystem
+-- Phase table system, restart routines, fresh start, alarm/abort mechanisms
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    phase_table: PhaseTable
+    alarm_state: AlarmState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum AgcVariant { comanche055_cm | luminary099_lm }
+
+enum PhaseType {
+    inactive
+    | display
+    | single_table
+    | double_table
+    | variable
+    | combined
+}
+
+enum RestartKind { job | task | longcall }
+
+-- allium-ignore allium.definition.unused
+enum AlarmSeverity { non_abortive | abortive | abortive_conditional }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- allium-ignore allium.definition.unused
+value PhaseEncoding {
+    -- Decoded representation of the phase number and its type
+    group: Integer
+    phase: Integer
+    phase_type: PhaseType
+
+    @guidance
+        -- Phase 0 / -0: inactive. Phase 1: display restart.
+        -- Even phases > 0: double-entry table restart (two things).
+        -- Odd phases > 1: single-entry table restart (one thing).
+}
+
+-- allium-ignore allium.definition.unused
+value PhaschngWordA {
+    -- Type A: TL0 00P PPP PPP GGG
+    group: Integer
+    phase: Integer
+    set_tbase: Boolean
+    set_longbase: Boolean
+
+    @guidance
+        -- Fixed phase assignment. T bit saves -C(TIME1) in TBASEn.
+        -- L bit saves C(TIME2,TIME1) in LONGBASE.
+}
+
+-- allium-ignore allium.definition.unused
+value PhaschngWordB {
+    -- Type B: TL1 DAP PPP PPP GGG
+    group: Integer
+    phase: Integer
+    set_tbase: Boolean
+    set_longbase: Boolean
+    read_priority: Boolean
+    read_2cadr: Boolean
+
+    @guidance
+        -- Combined: fixed phase in group, plus a variable job restart.
+        -- D bit: priority from next word. A bit: 2CADR from next two
+        -- words (else use return address). Positive priority means
+        -- FINDVAC, negative means NOVAC.
+}
+
+-- allium-ignore allium.definition.unused
+value PhaschngWordC {
+    -- Type C: TL0 1AD XXX CJW GGG
+    group: Integer
+    set_tbase: Boolean
+    set_longbase: Boolean
+    read_priority: Boolean
+    read_2cadr: Boolean
+    is_longcall: Boolean
+    is_job: Boolean
+    is_waitlist: Boolean
+
+    @guidance
+        -- Variable restart. Exactly one of C/J/W must be set.
+        -- Variable info stored in PHSNAMEn and PHSPRDTn registers.
+}
+
+-- allium-ignore allium.definition.unused
+value RestartTableEntry {
+    kind: RestartKind
+    address: Integer
+    bankset: Integer
+    priority_or_delta: Integer
+
+    @guidance
+        -- Table entries are 3 words: priority/delta-time, 2CADR.
+        -- Job: positive 2CADR, priority in PRDTTAB.
+        --   Positive priority -> FINDVAC, negative -> NOVAC.
+        -- Waitlist task: negative 2CADR (-2CADR) in CADRTAB,
+        --   delta-time in PRDTTAB. Positive DT = direct, negative
+        --   DT = indirect (-GENADR of DT location), -0 = immediate.
+        -- Longcall: negative GENADR in CADRTAB, positive BBCON,
+        --   GENADR of delta-time location in PRDTTAB.
+}
+
+value FailureRecord {
+    alarm_code: Integer
+    location: Integer?
+    bankset: Integer?
+
+    @guidance
+        -- Stored in FAILREG (three registers). Fills first empty
+        -- slot, or overwrites the third with BIT15 set to indicate
+        -- overflow. CM variant also saves LOC in LOCALARM and
+        -- BANKSET in BANKALRM; LM omits this.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity RestartGroup {
+    -- One of seven restart groups, each tracking a program's progress
+    index: Integer
+    phase: Integer
+    complement: Integer
+    tbase: Integer
+    active: Boolean
+    phase_type: PhaseType
+
+    -- Variable restart data (populated by Type B and Type C PHASCHNG)
+    variable_address: Integer?
+    variable_bankset: Integer?
+    variable_priority: Integer?
+
+    invariant ValidIndex {
+        index >= 1 and index <= config.max_groups
+    }
+
+    invariant ComplementAgreement {
+        -- XOR of phase and complement must yield -0.
+        -- Violation triggers alarm 1107 and fresh start.
+        phase xor complement = config.negative_zero
+    }
+
+    invariant InactiveConvention {
+        -- Inactive groups use -0, not +0. CCS-based scanning
+        -- in GOPROG3 depends on this: CCS of -0 falls to the
+        -- fourth branch (skip), CCS of positive falls to the
+        -- first branch (process).
+        not active implies phase = config.negative_zero
+    }
+}
+
+entity PhaseTable {
+    -- The complete phase table: seven groups plus shared state
+    variant: AgcVariant
+    groups: RestartGroup with phase_table = this
+    longbase_hi: Integer
+    longbase_lo: Integer
+    restart_counter: Integer
+
+    -- Derived
+    active_groups: groups where active = true
+
+    @guidance
+        -- LONGBASE is global, shared across all groups. Only one
+        -- LONGBASE exists. The L bit in PHASCHNG overwrites it.
+        -- If two groups both use longcall restarts, they share
+        -- LONGBASE. Coordination is the mission program's
+        -- responsibility.
+}
+
+entity AlarmState {
+    -- Tracks failure registers and alarm lamp state
+    prog_alarm_lit: Boolean
+    failure_registers: List<FailureRecord>
+
+    invariant MaxFailureRegisters {
+        failure_registers.count <= config.max_failure_registers
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    max_groups: Integer = 7
+    max_failure_registers: Integer = 3
+    negative_zero: Integer = -0
+    display_restart_priority: Integer = 14
+    immediate_restart_delta: Integer = 1
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Phase change operations ----------------------------------------
+
+rule SetPhaseTypeA {
+    -- PHASCHNG Type A: fixed phase assignment
+    when: SetPhaseTypeA(group_index, phase, set_tbase, set_longbase)
+
+    let group = find_group(group_index)
+
+    requires: group != null
+
+    ensures:
+        group.phase = phase
+        group.complement = complement_of(phase)
+        group.active = phase != config.negative_zero
+        group.phase_type = classify_phase(phase)
+        if set_tbase:
+            group.tbase = negate(current_time1())
+        if set_longbase:
+            phase_table.longbase_hi = current_time2()
+            phase_table.longbase_lo = current_time1()
+
+    @guidance
+        -- TL0 00P PPP PPP GGG. The complement is stored in -PHASEn
+        -- so that GOPROG3 can verify integrity via XOR.
+}
+
+rule SetPhaseTypeB {
+    -- PHASCHNG Type B: fixed phase plus variable job restart
+    when: SetPhaseTypeB(group_index, phase, set_tbase, set_longbase, priority, address, bankset)
+
+    let group = find_group(group_index)
+
+    requires: group != null
+
+    ensures:
+        group.phase = phase
+        group.complement = complement_of(phase)
+        group.active = true
+        group.phase_type = combined
+        group.variable_address = address
+        group.variable_bankset = bankset
+        group.variable_priority = priority
+        if set_tbase:
+            group.tbase = negate(current_time1())
+        if set_longbase:
+            phase_table.longbase_hi = current_time2()
+            phase_table.longbase_lo = current_time1()
+
+    @guidance
+        -- TL1 DAP PPP PPP GGG. The variable part stores a job
+        -- restart: positive priority -> FINDVAC, negative -> NOVAC.
+}
+
+rule SetPhaseTypeC {
+    -- PHASCHNG Type C: variable restart (job, task or longcall)
+    when: SetPhaseTypeC(group_index, set_tbase, set_longbase, kind, priority_or_delta, address, bankset)
+
+    let group = find_group(group_index)
+
+    requires: group != null
+
+    ensures:
+        group.phase = encode_variable_phase(kind)
+        group.complement = complement_of(group.phase)
+        group.active = true
+        group.phase_type = variable
+        group.variable_address = address
+        group.variable_bankset = bankset
+        group.variable_priority = priority_or_delta
+        if set_tbase:
+            group.tbase = negate(current_time1())
+        if set_longbase:
+            phase_table.longbase_hi = current_time2()
+            phase_table.longbase_lo = current_time1()
+
+    @guidance
+        -- TL0 1AD XXX CJW GGG. Exactly one of C/J/W bits set.
+        -- Variable data stored in PHSNAMEn (2CADR) and PHSPRDTn
+        -- (priority or delta-time).
+}
+
+rule SetPhaseDouble {
+    -- 2PHSCHNG: changes two groups atomically
+    when: SetPhaseDouble(first_group_index, first_phase, second_word)
+
+    let first_group = find_group(first_group_index)
+
+    requires:
+        first_group != null
+
+    ensures:
+        -- First word must be Type A
+        first_group.phase = first_phase
+        first_group.complement = complement_of(first_phase)
+        first_group.active = first_phase != config.negative_zero
+        first_group.phase_type = classify_phase(first_phase)
+        -- Second word processed as A, B or C per its encoding
+        ProcessSecondPhaschng(second_word)
+
+    @guidance
+        -- Used when working under one group's protection while
+        -- updating another. First OCT must be Type A; second
+        -- may be A, B or C.
+}
+
+rule SetPhaseQuick {
+    -- NEWPHASE: quick non-variable phase change
+    when: SetPhaseQuick(group_index, phase)
+
+    let group = find_group(group_index)
+
+    requires: group != null
+
+    ensures:
+        group.phase = abs(phase)
+        group.complement = complement_of(abs(phase))
+        group.active = abs(phase) != config.negative_zero
+        group.phase_type = classify_phase(abs(phase))
+        if phase < 0:
+            group.tbase = negate(current_time1())
+
+    @guidance
+        -- Phase in A register. Positive = no TBASE set.
+        -- Negative = set TBASE. Group number follows inline.
+}
+
+rule ClearPhase {
+    -- Deactivate a restart group
+    when: ClearPhase(group_index)
+
+    let group = find_group(group_index)
+
+    requires:
+        group != null
+        group.active = true
+
+    ensures:
+        group.phase = config.negative_zero
+        group.complement = config.negative_zero
+        group.active = false
+        group.phase_type = inactive
+        group.variable_address = null
+        group.variable_bankset = null
+        group.variable_priority = null
+}
+
+-- Restart execution ------------------------------------------------
+
+rule HardwareRestart {
+    -- GOPROG: entered on GOJAM (hardware reset to address 4000)
+    when: HardwareRestart()
+
+    ensures:
+        phase_table.restart_counter = phase_table.restart_counter + 1
+        SaveDebugContext()
+        if oscillator_failed() and agc_warning_on():
+            -- Restart loop detected
+            FreshStart()
+        else if mark_reject_pressed() and error_reset_pressed():
+            -- Operator-requested fresh start
+            FreshStart()
+        else:
+            RestoreErasableIfNeeded()
+            ReinitialiseAutopilots()
+            PreserveCriticalLamps()
+            ReinitialiseImuAndOpticsFlags()
+            PreserveEngineCommand()
+            CommonRestart()
+
+    @guidance
+        -- GOPROG increments REDOCTR, saves bank context in RSBBQ
+        -- and erasable snapshot in VAC5STOR for post-flight
+        -- debugging. The OSC FAIL + AGC WARNING check detects a
+        -- restart loop (the computer keeps resetting). MARK REJECT
+        -- + ERROR RESET is the crew's manual fresh start request.
+        -- ERESTORE handles the case where ERASCHK (self-test) was
+        -- interrupted mid-modification of erasable memory.
+}
+
+rule CommonRestart {
+    -- GOPROG3: shared restart path for both hardware and software restarts
+    when: CommonRestart()
+
+    ensures:
+        if not verify_all_phase_integrity():
+            RaiseAlarm(alarm_code: `1107`)
+            FreshStart()
+        else:
+            DisplayMajorMode()
+            RestartAllActiveGroups()
+            EnterIdleLoop()
+
+    @guidance
+        -- GOPROG3 performs the RXOR check on every group: PHASEn
+        -- XOR -PHASEn must yield -0. Any corruption triggers alarm
+        -- 1107 and a full fresh start.
+        --
+        -- After restarting all active groups, control passes to
+        -- DUMMYJOB. The restarted jobs and tasks will be dispatched
+        -- by the Executive and Waitlist in normal priority order.
+        --
+        -- Note: the source comments (line 88-89) describe displaying
+        -- alarm 1110 when no groups are active, but the code does not
+        -- actually raise this alarm. It silently enters idle or goes
+        -- to POOH. This is a comment/code divergence in the original.
+        --
+        -- Resolved: alarm 1110 is a ghost feature
+        --
+        -- Alarm 1110 ("restart with no active groups") is described in the
+        -- Comanche055 source comments (FRESH_START_AND_RESTART.agc lines
+        -- 88-89 and 134) but never implemented in code. The actual code path
+        -- at lines 460-466 silently enters idle (ENDRSTRT → DUMMYJOB) or
+        -- goes to GOTOPOOH without raising any alarm. Luminary099 does not
+        -- mention alarm 1110 at all. This is a comment/code divergence in
+        -- the original MIT source: a planned feature that was either removed
+        -- during development or never implemented.
+}
+
+rule RestartActiveGroup {
+    -- Process a single active restart group
+    when: RestartActiveGroup(group)
+
+    requires: group.active = true
+
+    ensures:
+        if group.phase_type = display:
+            -- X.1: restart DSKY display
+            CreateJobFindvac(
+                entry_point: initdsp_address(),
+                priority: config.display_restart_priority,
+                bankset: initdsp_bankset()
+            )
+        else if group.phase_type = variable:
+            RestartFromVariable(group)
+        else if group.phase_type = combined:
+            -- Type B: both variable job and table entry
+            RestartFromVariable(group)
+            RestartFromTable(group)
+        else if group.phase_type = single_table:
+            RestartFromTable(group)
+        else if group.phase_type = double_table:
+            RestartFromTable(group)
+            RestartSecondTableEntry(group)
+}
+
+rule RestartFromTable {
+    -- Look up a group's table entry and dispatch it
+    when: RestartFromTable(group)
+
+    let entry = lookup_table_entry(group.index, group.phase)
+
+    requires: entry != null
+
+    ensures:
+        if entry.kind = job:
+            RestartJob(entry)
+        else if entry.kind = task:
+            RestartTask(group, entry)
+        else if entry.kind = longcall:
+            RestartLongcall(entry)
+}
+
+rule RestartSecondTableEntry {
+    -- PHSPART2: process the second entry of an even-phase (double) table
+    when: RestartSecondTableEntry(group)
+
+    let entry = lookup_second_table_entry(group.index, group.phase)
+
+    requires: entry != null
+
+    ensures:
+        if entry.kind = job:
+            RestartJob(entry)
+        else if entry.kind = task:
+            RestartTask(group, entry)
+        else if entry.kind = longcall:
+            RestartLongcall(entry)
+}
+
+rule RestartFromVariable {
+    -- Restart using PHSNAMEn/PHSPRDTn stored data
+    when: RestartFromVariable(group)
+
+    requires:
+        group.variable_address != null
+        group.variable_priority != null
+
+    ensures:
+        if group.variable_priority > 0:
+            CreateJobFindvac(
+                entry_point: group.variable_address,
+                priority: group.variable_priority,
+                bankset: group.variable_bankset
+            )
+        else:
+            CreateJobNovac(
+                entry_point: group.variable_address,
+                priority: negate(group.variable_priority),
+                bankset: group.variable_bankset
+            )
+
+    @guidance
+        -- Positive priority -> FINDVAC (needs VAC area).
+        -- Negative priority -> NOVAC. Same convention as the
+        -- Executive's job creation routines.
+}
+
+rule RestartJob {
+    -- Restart a job from a table entry
+    when: RestartJob(entry)
+
+    requires: entry.kind = job
+
+    ensures:
+        if entry.priority_or_delta > 0:
+            CreateJobFindvac(
+                entry_point: entry.address,
+                priority: entry.priority_or_delta,
+                bankset: entry.bankset
+            )
+        else:
+            CreateJobNovac(
+                entry_point: entry.address,
+                priority: negate(entry.priority_or_delta),
+                bankset: entry.bankset
+            )
+}
+
+rule RestartTask {
+    -- Restart a waitlist task, computing remaining time from TBASE
+    when: RestartTask(group, entry)
+
+    let remaining = compute_remaining_time(group.tbase, entry.priority_or_delta)
+
+    requires: entry.kind = task
+
+    ensures:
+        if remaining > 0:
+            ScheduleTask(
+                entry_point: entry.address,
+                bankset: entry.bankset,
+                delta_time: remaining
+            )
+        else:
+            ScheduleTask(
+                entry_point: entry.address,
+                bankset: entry.bankset,
+                delta_time: config.immediate_restart_delta
+            )
+
+    @guidance
+        -- FINDTIME: negate delta-time, load -TBASEn (which is the
+        -- saved -C(TIME1)), subtract current TIME1, add delta-time.
+        -- If the result is positive, time remains. If zero or
+        -- negative, the task's deadline has passed and it runs
+        -- immediately (1 centisecond delay).
+        --
+        -- This works because TBASE stores -C(TIME1) at phase-set
+        -- time. The ones'-complement arithmetic handles TIME1
+        -- wraparound correctly.
+}
+
+rule RestartLongcall {
+    -- Restart a longcall, computing remaining time from LONGBASE
+    when: RestartLongcall(entry)
+
+    requires: entry.kind = longcall
+
+    ensures:
+        ScheduleLongcall(
+            entry_point: entry.address,
+            bankset: entry.bankset,
+            remaining_time: compute_longcall_remaining(
+                phase_table.longbase_hi,
+                phase_table.longbase_lo,
+                entry.priority_or_delta
+            )
+        )
+
+    @guidance
+        -- Retrieves the double-precision delta-time from the
+        -- location pointed to by PRDTTAB, computes remaining time
+        -- against LONGBASE (double-precision saved time), and
+        -- calls LONGCALL.
+}
+
+-- Fresh start and software restart --------------------------------
+
+rule FreshStart {
+    -- DOFSTART: complete reinitialisation, all state lost
+    when: FreshStart()
+
+    ensures:
+        ClearAllOutputChannels()
+        ClearDskyRegisters()
+        CleanPhaseTable()
+        InitialiseAllFlags()
+        EnterIdleLoop()
+
+    @guidance
+        -- Zeros ERESTORE, SMODE, UPSVFLAG. Clears all output
+        -- channels (RCS jets off, engine off, displays off).
+        -- Zeros DSKY registers. Calls MR.KLEAN to set all phase
+        -- table entries to (-0, -0). Initialises IMU flags, optics
+        -- flags, all flagwords. Enters DUMMYJOB idle loop.
+}
+
+rule CleanPhaseTable {
+    -- MR.KLEAN: set all groups to inactive
+    when: CleanPhaseTable()
+
+    for group in phase_table.groups:
+        ensures:
+            group.phase = config.negative_zero
+            group.complement = config.negative_zero
+            group.active = false
+            group.phase_type = inactive
+            group.variable_address = null
+            group.variable_bankset = null
+            group.variable_priority = null
+
+    @guidance
+        -- Stores (-0, -0) in all (-PHASEn, PHASEn) pairs.
+}
+
+rule SoftwareRestart {
+    -- ENEMA: software restart triggered by V37 major mode change
+    when: SoftwareRestart()
+
+    ensures:
+        ReinitialiseWaitlistAndExecutive()
+        KillIntegrationPrograms()
+        if tvc_dap_running():
+            RestartTvcexecTask()
+        CommonRestart()
+
+    @guidance
+        -- Calls STARTSB2 to reinitialise waitlist, executive, DSKY,
+        -- I/O channels. Kills integration-related programs. If TVC
+        -- DAP is running, restarts the TVCEXEC task. Then enters
+        -- GOPROG3 for the common restart path.
+}
+
+rule ReinitialiseWaitlistAndExecutive {
+    -- STARTSUB / STARTSB2: reinitialise scheduling subsystems
+    when: ReinitialiseWaitlistAndExecutive()
+
+    ensures:
+        ClearOutputChannels5And6()
+        InitialiseTimers()
+        ReplaceAllWaitlistTasksWithEndtask()
+        FreeAllCoreSetsAndVacAreas()
+        ClearDskyRegisters()
+        ZeroSwitches()
+        InitialisePeripheralFlags()
+
+    @guidance
+        -- STARTSUB clears channels 5,6 and initialises TIME5,TIME4,
+        -- TIME3. STARTSB2 initialises channels 11-14, replaces all
+        -- waitlist tasks with ENDTASK, frees all executive core sets
+        -- and VAC areas, clears DSKY registers, zeros switches, and
+        -- initialises optics/PIPA/telemetry flags.
+}
+
+-- Alarm and abort system -------------------------------------------
+
+rule RaiseAlarm {
+    -- ALARM: non-abortive alarm. Returns to caller.
+    when: RaiseAlarm(alarm_code)
+
+    ensures:
+        alarm_state.prog_alarm_lit = true
+        StoreFailureRegister(alarm_code: alarm_code)
+
+    @guidance
+        -- Turns on PROG ALARM lamp. Stores alarm code in FAILREG
+        -- (first empty slot, or overwrites third with BIT15 set
+        -- for overflow). CM variant saves LOC/BANKSET in
+        -- LOCALARM/BANKALRM; LM omits this.
+}
+
+rule Bailout {
+    -- BAILOUT: abortive alarm for software errors
+    when: Bailout(alarm_code)
+
+    ensures:
+        SaveErasableSnapshot()
+        alarm_state.prog_alarm_lit = true
+        StoreFailureRegister(alarm_code: alarm_code)
+        SoftwareRestart()
+
+    @guidance
+        -- Saves erasables in VAC5STOR for debugging, turns on
+        -- PROG ALARM, stores alarm code, then enters WHIMPER
+        -- which does a controlled restart via RESUME to ENEMA.
+        --
+        -- CM (Comanche055): saves Q in ALMCADR, calls
+        -- BANKCALL/VAC5STOR, reads alarm from ALMCADR.
+        -- LM (Luminary099): reads alarm directly via INDEX Q,
+        -- doesn't save Q first. This is BAILOUT1.
+}
+
+rule Poodoo {
+    -- POODOO: conditional abort, protects powered flight
+    when: Poodoo(alarm_code)
+
+    ensures:
+        if average_g_running():
+            -- Don't disrupt powered flight, use lighter-weight abort
+            Bailout(alarm_code: alarm_code)
+        else:
+            -- More aggressive: clear state flags and phase tables
+            ClearStateFlags()
+            CleanPhaseTable()
+            alarm_state.prog_alarm_lit = true
+            StoreFailureRegister(alarm_code: alarm_code)
+            SoftwareRestart()
+
+    @guidance
+        -- Checks V37FLBIT in FLAGWRD7 (Comanche055) to determine
+        -- if Average G is running. If so, falls through to BAILOUT
+        -- to avoid disrupting powered flight guidance. If not,
+        -- performs a more aggressive cleanup with MR.KLEAN before
+        -- restarting.
+        --
+        -- Luminary099 uses POODOO1 with different flag logic and
+        -- the same INDEX Q pattern as BAILOUT1.
+}
+
+rule CcsholeTrap {
+    -- CCSHOLE: trap for unused CCS branches
+    when: CcsholeTrap()
+
+    ensures:
+        Bailout(alarm_code: `1103`)
+
+    @guidance
+        -- Every unused CCS branch in the AGC jumps to CCSHOLE,
+        -- which triggers alarm 1103. This catches logic errors
+        -- where a CCS instruction reaches a branch that should
+        -- be unreachable given the input value constraints.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant PhaseComplementIntegrity {
+    -- Every group's phase and complement must agree.
+    -- GOPROG3 checks this via XOR; failure means memory corruption.
+    for group in RestartGroups:
+        group.phase xor group.complement = config.negative_zero
+}
+
+invariant InactiveGroupsUseNegativeZero {
+    -- Inactive groups must have -0, not +0, in PHASEn.
+    -- The CCS-based scanning in GOPROG3 depends on this distinction.
+    for group in RestartGroups:
+        not group.active implies group.phase = config.negative_zero
+}
+
+invariant SingleLongbase {
+    -- Only one LONGBASE exists for all groups. Groups using longcall
+    -- restarts share it. The L bit in any PHASCHNG overwrites the
+    -- global LONGBASE unconditionally.
+    for a in RestartGroups:
+        for b in RestartGroups:
+            a != b implies not (
+                a.phase_type = variable and a.variable_priority != null
+                and b.phase_type = variable and b.variable_priority != null
+            )
+}
+
+------------------------------------------------------------
+-- Implementation notes
+------------------------------------------------------------
+
+-- GOLOC trampoline
+--
+-- The restart routine uses GOLOC (5 words in the VAC5 area) as an
+-- indirect call mechanism. GOLOC-1 holds the address of the target
+-- routine (WAITLIST, FINDVAC, NOVAC or LONGCALL). GOLOC holds the
+-- 2CADR (entry point). GOLOC+2 holds the return address, which
+-- points either to the next group's processing or to PHSPART2 for
+-- the second entry of an even-phase table. This avoids needing
+-- separate call sequences for each restart kind.
+
+-- ERESTORE mechanism
+--
+-- ERASCHK (the self-check routine) temporarily modifies erasable
+-- memory to verify it. If a GOJAM occurs during ERASCHK, the
+-- modified word must be restored. GOPROG checks ERESTORE: if
+-- non-zero, it contains the address of the modified location, and
+-- SKEEP7 contains the original value. GOPROG restores the value
+-- and zeros ERESTORE. This is the only case where GOPROG performs
+-- erasable memory restoration.
+
+-- LONGBASE sharing
+--
+-- LONGBASE is a single double-precision register pair shared by all
+-- restart groups. The L bit in any PHASCHNG call overwrites LONGBASE
+-- unconditionally. If two groups both use longcall restarts with
+-- different time bases, the second PHASCHNG overwrites the first
+-- group's LONGBASE. Whether this is safe depends entirely on whether
+-- the mission programs coordinate their use of the L bit. In
+-- practice, mission programs appear to avoid this conflict, but the
+-- architecture does not enforce it.
+
+-- Priority sign convention
+--
+-- The restart system uses the same priority sign convention as the
+-- Executive: positive priority means FINDVAC (job needs a VAC area
+-- for interpretive work), negative priority means NOVAC (basic job).
+-- This is encoded in PRDTTAB entries and in PHSPRDTn for variable
+-- restarts.
+
+-- CCS-based group scanning
+--
+-- GOPROG3 scans groups using CCS on PHASEn. CCS has four branches:
+-- positive (> 0), +0, negative (< -0), -0. Active groups have
+-- positive phase numbers, falling to the first branch. Inactive
+-- groups have -0, falling to the fourth branch (skip). The +0 and
+-- negative branches are TC CCSHOLE traps, since phase numbers should
+-- never be +0 or negative in a consistent phase table.
+
+-- Restart counter
+--
+-- REDOCTR is incremented on every GOJAM. The restart logic itself
+-- does not use it. It exists for telemetry: ground controllers can
+-- read REDOCTR to see how many restarts the computer has undergone
+-- during the mission. A high count indicates hardware problems.
+
+-- Key alarm codes
+--
+-- 1103: CCSHOLE trap (unused CCS branch reached)
+-- 1107: phase table integrity failure (XOR check)
+-- 1110: restart completed with no active groups
+-- 1201: no VAC areas available (Executive)
+-- 1202: no core sets available (Executive)
+-- 1203: waitlist overflow
+-- 1204: bad delta-time (zero or negative)
+-- 1301: ARCCOS overflow
+-- 1302: SQRT of negative number
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Black box functions used in rules:
+-- find_group(index): returns the RestartGroup with the given index
+-- complement_of(phase): returns the ones'-complement of the phase number
+-- classify_phase(phase): maps a phase number to its PhaseType
+-- encode_variable_phase(kind): encodes C/J/W bits into a phase value
+-- negate(value): ones'-complement negation
+-- current_time1(): current value of TIME1 register
+-- current_time2(): current value of TIME2 register
+-- compute_remaining_time(tbase, delta): FINDTIME calculation
+-- compute_longcall_remaining(hi, lo, entry): double-precision time remaining
+-- lookup_table_entry(group, phase): reads CADRTAB/PRDTTAB via SIZETAB offsets
+-- lookup_second_table_entry(group, phase): reads second entry of even-phase table
+-- oscillator_failed(): checks OSC FAIL bit
+-- agc_warning_on(): checks AGC WARNING bit
+-- mark_reject_pressed(): checks MARK REJECT button
+-- error_reset_pressed(): checks ERROR RESET button
+-- average_g_running(): checks V37FLBIT in FLAGWRD7
+-- tvc_dap_running(): checks TVC DAP mode flags
+-- initdsp_address(): returns INITDSP entry point address
+-- initdsp_bankset(): returns INITDSP bank context
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PhaseTable.find_group    -- see: Comanche055/RESTART_TABLES.agc, Luminary099/RESTART_TABLES.agc
+    -- Returns the RestartGroup entity for a given index (1-7).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PhaseTable.complement_of    -- see: Comanche055/FRESH_START_AND_RESTART.agc
+    -- Ones'-complement of the phase number. Stored in -PHASEn.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PhaseTable.classify_phase    -- see: Comanche055/FRESH_START_AND_RESTART.agc
+    -- Phase 0/-0 -> inactive, 1 -> display, even > 0 -> double_table,
+    -- odd > 1 -> single_table. Variable phases have bits 10-11 set.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PhaseTable.compute_remaining_time    -- see: Comanche055/FRESH_START_AND_RESTART.agc
+    -- FINDTIME: COM delta, CS TBASEn, SU TIME1, handle wrap,
+    -- AD delta. Returns remaining centiseconds, or <= 0 if elapsed.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PhaseTable.compute_longcall_remaining    -- see: Comanche055/FRESH_START_AND_RESTART.agc
+    -- Double-precision subtraction of elapsed time from LONGBASE
+    -- to determine remaining time for a longcall restart.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PhaseTable.lookup_table_entry    -- see: Comanche055/RESTART_TABLES.agc, Luminary099/RESTART_TABLES.agc
+    -- Uses SIZETAB to compute base offset for the group, then
+    -- indexes into CADRTAB and PRDTTAB. Table entries are named
+    -- N.MSPOT where N = group, M = phase.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PhaseTable.lookup_second_table_entry    -- see: Comanche055/RESTART_TABLES.agc
+    -- For even-phase (double) tables, reads the second 3-word entry
+    -- at offset +3 from the first entry's base.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+open question "LONGBASE is shared across all seven restart groups. If two groups both set the L bit in their PHASCHNG calls, the second overwrites the first's time base. The architecture provides no mechanism to detect or prevent this. Do any mission programs actually use longcall restarts in multiple groups simultaneously? If so, how do they coordinate?"
+
+open question "GOPROG3 checks phase integrity sequentially across all groups. If it finds corruption in one group, it triggers alarm 1107 and does a fresh start, abandoning all groups. What if only one group is corrupt and the others are valid? The current behaviour discards all restart state rather than attempting partial recovery. Was partial recovery considered and rejected, or simply not worth the code space?"
+
+open question "The restart counter (REDOCTR) is incremented on every GOJAM but never reset during the mission. If the counter overflows (it is a 15-bit register, max 16383), does it wrap silently? The source does not appear to check for overflow."

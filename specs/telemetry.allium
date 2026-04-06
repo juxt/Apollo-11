@@ -1,0 +1,455 @@
+-- allium: 3
+-- Apollo Guidance Computer — Downlink telemetry subsystem
+-- Transmits AGC data to the ground via DOWNRUPT at 50 words/second
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    telemetry: TelemetryState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ListEntryKind {
+    data_1w
+    | data_2w
+    | data_3w
+    | data_4w
+    | data_5w
+    | data_6w
+    | channel
+    | pointer
+}
+
+enum DownlinkListId {
+    -- CM lists (Comanche055)
+    cm_coast_align
+    | cm_entry_update
+    | cm_rendezvous
+    | cm_powered_flight
+    | cm_p22
+    -- LM lists (Luminary099)
+    | lm_coast_align
+    | lm_ags_init
+    | lm_rendezvous
+    | lm_orbital_maneuvers
+    | lm_descent_ascent
+    | lm_lunar_surface_align
+}
+
+enum TelemetryPhase { idle | sending_id | traversing_list | erasable_dump }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- allium-ignore allium.definition.unused
+value ListEntry {
+    kind: ListEntryKind
+    address: Integer
+
+    @guidance
+        -- Encoded as a 15-bit word. Bits 14-12 encode the kind:
+        -- 000 = 1DNADR (1 DP word), 001-101 = 2DNADR through 6DNADR,
+        -- 110 = DNPTR (sublist pointer), 111 = DNCHAN (channel pair).
+        -- Bits 11-0 hold the ECADR, channel address or sublist ADRES.
+        -- A negative entry (bit 15 set) marks end-of-list or
+        -- end-of-sublist.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity TelemetryState {
+    -- One instance per AGC, driven by DOWNRUPT
+    phase: TelemetryPhase
+    list_id: DownlinkListId
+    list_base: Integer
+    list_pointer: Integer
+    sublist_pointer: Integer?
+    buffer_index: Integer
+    word_order_code: Integer
+    cycle_position: Integer
+
+    -- DNTMBUFF: 22-word snapshot buffer
+    buffer_full: Boolean
+
+    -- Erasable dump state (V74E)
+    dump_location: Integer?
+    dump_count: Integer?
+
+    -- Derived
+    in_sublist: sublist_pointer != null
+    at_list_end: list_pointer < 0
+    in_snapshot: Boolean
+
+    transitions phase {
+        idle -> traversing_list
+        traversing_list -> sending_id
+        sending_id -> traversing_list
+        traversing_list -> erasable_dump
+        erasable_dump -> traversing_list
+        erasable_dump -> sending_id
+    }
+
+    invariant PointerWithinList {
+        phase = traversing_list implies
+            list_pointer >= list_base or at_list_end
+    }
+
+    invariant CyclePositionBound {
+        cycle_position >= 0 and cycle_position < config.downrupts_per_cycle
+    }
+
+    invariant BufferIndexBound {
+        buffer_index >= 0 and buffer_index <= config.snapshot_buffer_words
+    }
+
+    @guidance
+        -- Key erasable registers:
+        -- DNTMGOTO: dispatch pointer, initially DNPHASE1, then DNPHASE2
+        -- DNLSTADR: base address of the current downlink list
+        -- DNLSTCOD: index into DNTABLE selecting the active list
+        -- DNTMBUFF: 22-word snapshot buffer (11 DP words)
+        -- TMINDEX (alias DNECADR): current DNADR being processed
+        -- CTLIST (alias LDATALST): control list position
+        -- SUBLIST (alias DNQ): sublist position, negative when inactive
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    downrupt_interval_ms: Integer = 20
+    downrupts_per_cycle: Integer = 100
+    words_per_cycle: Integer = 200
+    snapshot_buffer_words: Integer = 22
+    cm_list_count: Integer = 5
+    lm_list_count: Integer = 6
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- DOWNRUPT handler ------------------------------------------------
+
+rule HandleDownrupt {
+    -- DODOWNTM: entered every 20ms via DOWNRUPT. Sets word order
+    -- code bit in channel 13, then dispatches via DNTMGOTO.
+    when: Downrupt()
+
+    requires: telemetry.phase != idle
+
+    ensures:
+        telemetry.word_order_code = 1
+        DispatchPhase(telemetry: telemetry)
+        telemetry.cycle_position = modulo(telemetry.cycle_position + 1, config.downrupts_per_cycle)
+
+    @guidance
+        -- The word order code (bit 7 of channel 13) is set to 1 on
+        -- every DOWNRUPT via WOR. It is reset to 0 at the start of
+        -- each new list and when 1DNADR TIME2 is encountered in the
+        -- control list. This allows the ground to identify the
+        -- beginning of each 2-second frame.
+}
+
+-- List traversal --------------------------------------------------
+
+rule TraverseControlList {
+    -- NEXTINCL: fetches the next entry from the control list.
+    -- Dispatches based on the entry kind.
+    when: DispatchPhase()
+
+    requires:
+        telemetry.phase = traversing_list
+        not telemetry.in_sublist
+
+    ensures:
+        if telemetry.at_list_end:
+            CycleWrap(telemetry: telemetry)
+        else:
+            ProcessEntry(telemetry: telemetry)
+            telemetry.list_pointer = telemetry.list_pointer + 1
+}
+
+rule TraverseSublist {
+    -- NEXTINSL: fetches the next entry from the current sublist.
+    when: DispatchPhase()
+
+    requires:
+        telemetry.phase = traversing_list
+        telemetry.in_sublist
+        not telemetry.in_snapshot
+
+    ensures:
+        ProcessEntry(telemetry: telemetry)
+        telemetry.sublist_pointer = telemetry.sublist_pointer + 1
+
+    @guidance
+        -- DNPTR cannot appear in sublists. Only data addresses
+        -- (1DNADR through 6DNADR) and DNCHAN are valid here.
+}
+
+-- Data operations -------------------------------------------------
+
+rule FetchDataWords {
+    -- FETCH2WD: reads a double-precision word from erasable memory
+    -- at the address encoded in DNECADR, decrements the count,
+    -- and writes to output channels 34 and 35.
+    when: ProcessEntry()
+
+    let entry_kind = current_entry_kind(telemetry)
+
+    requires:
+        entry_kind != pointer
+        entry_kind != channel
+
+    ensures:
+        WriteChannels(telemetry: telemetry)
+
+    @guidance
+        -- DNADRDCR (OCT 74001) simultaneously decrements the DNADR
+        -- count in bits 14-12 and increments the ECADR in bits 11-0
+        -- by 1, advancing to the next DP word. For multi-word entries
+        -- (2DNADR through 6DNADR), successive DOWNRUPTs continue
+        -- fetching until the count reaches zero.
+}
+
+rule FetchChannelPair {
+    -- DODNCHAN: reads two consecutive I/O channels and writes
+    -- them to channels 34 and 35.
+    when: ProcessEntry()
+
+    let entry_kind = current_entry_kind(telemetry)
+
+    requires: entry_kind = channel
+
+    ensures:
+        WriteChannels(telemetry: telemetry)
+
+    @guidance
+        -- Uses self-modifying code: TC 6 is executed as EXTEND,
+        -- and INDEX DNECADR / INDEX 0 -4000 is executed as READ.
+        -- Reads channels N and N+1 where N is the channel address.
+}
+
+rule EnterSublist {
+    -- DODNPTR: a DNPTR entry in the control list redirects
+    -- processing into a sublist.
+    when: ProcessEntry()
+
+    let entry_kind = current_entry_kind(telemetry)
+
+    requires: entry_kind = pointer
+
+    ensures:
+        telemetry.sublist_pointer = sublist_base(telemetry)
+
+    @guidance
+        -- The first word of the sublist is inspected via CCS to
+        -- distinguish snapshot sublists (first entry is negative,
+        -- i.e. -1DNADR) from regular sublists (first entry positive).
+}
+
+-- Snapshot --------------------------------------------------------
+
+rule TakeSnapshot {
+    -- SNAPLOOP: when a snapshot sublist is entered (first entry is
+    -- -1DNADR), copies up to 11 DP words into DNTMBUFF, then
+    -- immediately sends the 12th (first in list order).
+    when: ProcessEntry()
+
+    requires: telemetry.in_snapshot = true
+
+    ensures:
+        telemetry.buffer_full = true
+        WriteChannels(telemetry: telemetry)
+
+    @guidance
+        -- Snapshot sublists contain only 1DNADRs. The first 11 entries
+        -- are buffered in DNTMBUFF (indices 0-21), and the last entry
+        -- (which appears first in the sublist due to the coding) is
+        -- sent immediately. This ensures a consistent view of
+        -- related data (e.g. position and velocity vectors) despite
+        -- the data being transmitted over multiple DOWNRUPTs.
+        --
+        -- The 1DNADRs in a snapshot sublist cannot reference the first
+        -- word of any EBANK (addresses 0, 0400, 1000, etc.) because
+        -- the CCS instruction uses zero as the end-of-snapshot marker.
+}
+
+-- Cycle management ------------------------------------------------
+
+rule CycleWrap {
+    -- At end of list, resets the pointer to the beginning of the
+    -- current downlink list for the next 2-second cycle.
+    when: CycleWrap()
+
+    ensures:
+        telemetry.list_pointer = telemetry.list_base
+        telemetry.sublist_pointer = null
+        telemetry.cycle_position = 0
+        SendListId(telemetry: telemetry)
+}
+
+rule SendListId {
+    -- SENDID: transmits the list identification word (ERASID or
+    -- list code) and sync bits (LOWIDCOD) at the start of each
+    -- 2-second cycle. Resets word order code to 0.
+    when: SendListId()
+
+    ensures:
+        telemetry.word_order_code = 0
+        WriteChannels(telemetry: telemetry)
+
+    @guidance
+        -- ERASID identifies the spacecraft (bit pattern differs
+        -- between CM and LM). LOWIDCOD (OCT 77340) provides sync
+        -- bits for the ground to frame-lock.
+}
+
+-- List selection --------------------------------------------------
+
+rule SelectDownlinkList {
+    -- List selection via V37 (major mode change), fresh start,
+    -- or the update program (P27).
+    when: SelectDownlinkList(new_list: DownlinkListId)
+
+    ensures:
+        telemetry.list_id = new_list
+        telemetry.list_base = list_base_address(new_list)
+        telemetry.list_pointer = telemetry.list_base
+        telemetry.sublist_pointer = null
+
+    @guidance
+        -- DNLSTCOD indexes into DNTABLE to obtain the GENADR of
+        -- the selected list. DNLSTADR receives the list base.
+        -- To interrupt the current list mid-cycle:
+        -- 1. Store the new list ADRES into DNLSTADR
+        -- 2. Store NEGONE into SUBLIST and DNECADR
+        -- This causes DNPHASE2 to fall through to CHKLIST, which
+        -- detects the negative CTLIST and enters NEWLIST.
+}
+
+-- Restart protection ----------------------------------------------
+
+rule RestartTelemetry {
+    -- On fresh start or restart, STARTSUB resets DNTMGOTO to the
+    -- beginning of the current downlist. Channels 13, 34 and 35
+    -- are zeroed.
+    when: Restart()
+
+    ensures:
+        telemetry.list_pointer = telemetry.list_base
+        telemetry.sublist_pointer = null
+        telemetry.buffer_index = 0
+        telemetry.in_snapshot = false
+        telemetry.word_order_code = 0
+        telemetry.cycle_position = 0
+        ZeroChannels()
+
+    @guidance
+        -- The remainder of the in-progress downlist is abandoned.
+        -- Telemetry resumes from the beginning of whatever list
+        -- DNLSTADR points to. This is safe because the ground
+        -- re-syncs on the ID word at the start of each list.
+}
+
+-- Erasable dump ---------------------------------------------------
+
+rule InitiateErasableDump {
+    -- V74E: interrupts the current downlist and begins dumping
+    -- all erasable memory.
+    when: InitiateErasableDump()
+
+    ensures:
+        telemetry.phase = erasable_dump
+        telemetry.dump_location = 0
+        telemetry.dump_count = 0
+
+    @guidance
+        -- DNDUMPI initialises DUMPLOC to 0 and sets DNTMGOTO
+        -- to DNDUMP1. Each EBANK is preceded by an ID word
+        -- (ERASID), sync bits (LOWIDCOD), DUMPLOC and TIME1.
+        -- DUMPCNT controls how many complete passes are made
+        -- (1 to 4). Bits 14, 13 and 12 encode 4, 2 and 1
+        -- passes respectively.
+        --
+        -- Termination: fresh start, completion of requested
+        -- dump count, or involuntary restart. There is no
+        -- voluntary abort.
+}
+
+rule CompleteErasableDump {
+    -- DNPHASE1: when the requested number of dumps is complete,
+    -- resumes the interrupted downlist.
+    when: ErasableDumpComplete()
+
+    requires: telemetry.phase = erasable_dump
+
+    ensures:
+        telemetry.phase = traversing_list
+        telemetry.list_pointer = telemetry.list_base
+        telemetry.sublist_pointer = null
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant TwoSecondCycle {
+    -- Each complete list traversal sends exactly 200 AGC words
+    -- (100 double-precision values) over 100 DOWNRUPTs.
+    for t in TelemetryStates:
+        t.phase = traversing_list implies
+            t.cycle_position < config.downrupts_per_cycle
+}
+
+invariant SnapshotConsistency {
+    -- Snapshot data is buffered atomically within a single DOWNRUPT.
+    -- Once buffered, subsequent DOWNRUPTs read from DNTMBUFF rather
+    -- than from live erasable memory.
+    for t in TelemetryStates:
+        t.buffer_full implies t.buffer_index <= config.snapshot_buffer_words
+}
+
+invariant ChannelWriteExclusivity {
+    -- Channels 34 and 35 are written only during DNTMEXIT,
+    -- at most once per DOWNRUPT. No other interrupt handler
+    -- writes to these channels.
+    telemetry.channel_write_count <= 1
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred TelemetryState.current_entry_kind    -- see: Comanche055/DOWN-TELEMETRY_PROGRAM.agc
+    -- Extracts the entry kind from bits 14-12 of the current
+    -- list entry word. Returns the ListEntryKind.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred TelemetryState.sublist_base    -- see: Comanche055/DOWN-TELEMETRY_PROGRAM.agc
+    -- Resolves a DNPTR entry to the base address of the target
+    -- sublist. The pointer is a fixed-memory ADRES.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred TelemetryState.list_base_address    -- see: Comanche055/DOWNLINK_LISTS.agc, Luminary099/DOWNLINK_LISTS.agc
+    -- Maps a DownlinkListId to the GENADR of the corresponding
+    -- list via DNTABLE. CM has 5 entries, LM has 6.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The DOWNRUPT fires every 20ms regardless of whether DODOWNTM completes in time. If the handler overruns (e.g. during a snapshot of 12 DP words), does the hardware queue the next DOWNRUPT or drop it? The source comments do not address this. The snapshot loop is the longest code path and appears designed to fit within 20ms, but there is no explicit timing guard."
+
+open question "DNDUMP uses MASK to read erasable registers (rather than DCA) to avoid disturbing editing registers 20-23. This means the dump does not capture the true contents of those registers. Is this a known limitation accepted by the ground, or do the editing registers have a separate telemetry path?"

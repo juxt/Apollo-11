@@ -1,0 +1,484 @@
+-- allium: 3
+-- Apollo Guidance Computer — Entry programs (P61–P67)
+-- CM atmospheric entry sequence from preparation through steering termination
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    entry_sequence: EntrySequence
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum EntryProgram { p61 | p62 | p63 | p64 | p65 | p66 | p67 }
+
+enum SeparationState { armed | commanded | confirmed }
+
+enum EntryGuidanceMode { pre_entry | constant_drag | upcontrol | kepler | final_phase }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value EntryPad {
+    -- Pad-loaded entry parameters from ground
+    entry_angle: Decimal
+    range_to_target: Decimal
+    max_deceleration_g: Decimal
+    emsalt_m: Decimal
+    alfapad: Decimal
+    ladpad: Decimal
+    lodpad: Decimal
+
+    @guidance
+        -- Uplinked before entry preparation. EMSALT is the 0.05g
+        -- altitude above the Fischer ellipsoid. ALFAPAD is the
+        -- hypersonic CM trim angle of attack. LADPAD and LODPAD
+        -- are lift-to-drag ratio pad values used by entry guidance.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity EntrySequence {
+    -- The overall entry sequence state machine
+    current_program: EntryProgram
+    entry_pad: EntryPad
+    guidance_mode: EntryGuidanceMode
+
+    -- Separation tracking
+    separation: SeparationState? when current_program = p62
+
+    -- Lift vector orientation: true = lift down (ROLLC=180), false = lift up (ROLLC=0)
+    heads_up: Boolean
+
+    -- Once entry begins there is no abort
+    committed: Boolean
+
+    -- Restart protection group (group 5 for entry programs)
+    restart_group: Integer
+
+    transitions current_program {
+        p61 -> p62
+        p62 -> p63
+        p63 -> p64
+        p64 -> p65
+        p64 -> p67
+        p65 -> p66
+        p65 -> p67
+        p66 -> p67
+        terminal: p67
+    }
+
+    @guidance
+        -- The entry sequence is strictly sequential but not purely
+        -- linear. P64 can skip to P67 if velocity is below 27000 fps
+        -- at 0.2g, bypassing up-control. P65 can skip to P67 if
+        -- no up-control solution exists with VL > 18000 fps. P66
+        -- always transitions to P67 (final phase).
+        --
+        -- P61 through P63 are crew-initiated (V37E for program
+        -- changes). P64 onward is automatic, entered via RTB from
+        -- the entry guidance steering loop (REENTRY_CONTROL).
+        --
+        -- Restart protection uses group 5 with variable phases.
+        -- The phase number encodes which program was active so that
+        -- GOPROG can resume the correct point in the sequence.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- 0.05g drag threshold marking atmosphere contact
+    drag_threshold_05g_fpss: Decimal = 0.05
+
+    -- Range threshold for P65 transition (nautical miles)
+    upcontrol_range_threshold_nm: Decimal = 25.0
+
+    -- Velocity threshold for P67 final phase (feet per second)
+    final_phase_velocity_fps: Decimal = 1000.0
+
+    -- Velocity threshold at 0.2g for P64 skip to P67
+    skip_to_final_velocity_fps: Decimal = 27000.0
+
+    -- P62 separation delay after command (seconds)
+    separation_confirm_delay_s: Integer = 10
+
+    -- Restart group assignment
+    entry_restart_group: Integer = 5
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- P61: Entry preparation ----------------------------------------
+
+rule P61EntryPreparation {
+    -- Calculates and displays EMS initialisation data. Locks out
+    -- extended verbs to use TFF routines. Calls S61.1 to check
+    -- state vector and IMU orientation.
+    when: StartProgram(program: p61)
+
+    requires: entry_sequence.committed = false
+
+    ensures:
+        entry_sequence.current_program = p61
+        entry_sequence.committed = true
+        entry_sequence.guidance_mode = pre_entry
+        entry_sequence.restart_group = config.entry_restart_group
+        DisplayDsky(verb: 6, noun: 60)
+        CheckStateVectorAndImu()
+
+    @guidance
+        -- P61 is entered via V37E61E. It displays V06N60 (GMAX,
+        -- VPRED, GAMMAEI) and V06N63 (RTGO, VIO, TTE) for crew
+        -- review. The astronaut reviews displayed parameters and
+        -- proceeds with PRO, which falls through to P62.
+        --
+        -- S61.1 checks whether AVERAGEG is running. If not, it
+        -- updates the state vector to present time and starts
+        -- AVERAGEG. It also checks whether the IMU Y axis is within
+        -- 30 degrees of the velocity vector, raising alarm 01426
+        -- (IMU unsatisfactory) or 01427 (IMU reversed) if not.
+}
+
+-- P62: CM/SM separation and entry attitude ----------------------
+
+rule P62Separation {
+    -- Notifies the crew when the GNC system is prepared for CM/SM
+    -- separation. Orients the CM to the correct entry attitude.
+    when: StartProgram(program: p62)
+
+    requires:
+        entry_sequence.current_program = p61
+
+    ensures:
+        entry_sequence.current_program = p62
+        entry_sequence.separation = armed
+        CalculateDesiredGimbalAngles()
+        StartEntryDap()
+        DisplayDsky(verb: 6, noun: 61)
+
+    @guidance
+        -- P62 calls S61.1 again, then calculates desired 0.05g
+        -- gimbal angles via S62.3. It starts CM/POSE and body rate
+        -- calculation via CM/DAPIC, which enables the entry DAP.
+        --
+        -- After crew PRO (requesting separation), V06N61 displays
+        -- LAT(SPL), LNG(SPL) and HEADSUP for verification. ROLLC
+        -- is set from HEADSUP: positive means lift down (180 deg),
+        -- negative means lift up (0 deg). ALFACOM is set to ALFAPAD
+        -- (nominal trim angle of attack).
+        --
+        -- P62 sets P63FLAG to +1, allowing EXDAP2 to trigger P63
+        -- when the vehicle manoeuvre is complete. WAKEP62 is called
+        -- from the entry DAP once attitude error is reduced.
+}
+
+rule P62CommandSeparation {
+    -- Crew confirms separation. Pyrotechnic command is issued.
+    when: AstronautProceeds(program: p62)
+
+    requires:
+        entry_sequence.current_program = p62
+        entry_sequence.separation = armed
+
+    ensures:
+        entry_sequence.separation = commanded
+        CommandSeparationPyro()
+        ScheduleTask(task: ConfirmSeparation, delay: config.separation_confirm_delay_s)
+
+    @guidance
+        -- Separation pyros fire via channel 32 bit commands.
+        -- The CM/SM umbilical is severed and the SM RCS
+        -- provides a separation delta-V to move the SM clear.
+        -- Once commanded there is no way to reconnect.
+}
+
+rule P62SeparationConfirmed {
+    -- Separation confirmed by elapsed time (no physical feedback sensor).
+    when: ConfirmSeparation()
+
+    requires:
+        entry_sequence.current_program = p62
+        entry_sequence.separation = commanded
+
+    ensures:
+        entry_sequence.separation = confirmed
+
+    @guidance
+        -- The AGC has no direct sensor for mechanical separation.
+        -- Confirmation is by timeout. If the crew observes separation
+        -- failure they would take manual action outside AGC control.
+}
+
+-- P63: Pre-0.05g monitoring and entry initialisation ------------
+
+rule P63EntryInit {
+    -- Initialises the entry equations. Holds the CM to the correct
+    -- atmospheric entry attitude. Senses 0.05g drag onset.
+    when: StartProgram(program: p63)
+
+    requires:
+        entry_sequence.current_program = p62
+
+    ensures:
+        entry_sequence.current_program = p63
+        entry_sequence.separation = null
+        InitialiseEntryEquations()
+        DisplayDsky(verb: 6, noun: 64)
+
+    @guidance
+        -- P63 sets POSEXIT to STARTENT so that the next CM/POSE
+        -- cycle enters the entry guidance initialisation. V06N64
+        -- displays drag (G), inertial velocity (VI) and range
+        -- to splash (R TO SPLSH).
+        --
+        -- P63FLAG is set to -1 to prevent the exo-atmospheric DAP
+        -- from calling P63 out of sequence during P66.
+        --
+        -- P63 flushes the N22 display (CDU angles) from P62 and
+        -- disables group 4 restart protection. From this point,
+        -- display restarts are handled via the entry steering loop.
+        --
+        -- P63 monitors drag until 0.05g is exceeded, at which point
+        -- the entry guidance steering loop transitions to P64 via RTB.
+}
+
+-- P64: 0.05g guided entry start --------------------------------
+
+rule P64GuidedEntryStart {
+    -- Entered via RTB when sensed drag exceeds 0.05g. Starts entry
+    -- guidance, selecting roll attitude, constant drag level and
+    -- drag threshold KA keyed to the 0.05g point.
+    when: DragExceeds05g()
+
+    requires:
+        entry_sequence.current_program = p63
+
+    ensures:
+        entry_sequence.current_program = p64
+        entry_sequence.guidance_mode = constant_drag
+        DisplayDsky(verb: 6, noun: 74)
+
+    @guidance
+        -- P64 is called each pass through the entry steering loop.
+        -- V06N74 displays ROLLC, inertial velocity (VI) and drag
+        -- (D). The display is set via ENTRYVN for OVERNOUT.
+        --
+        -- P64 has four exit paths:
+        -- 1. If V < 27000 fps when 0.2g occurs, skip to P67 (final phase).
+        -- 2. If V > 27000 fps and altitude rate/drag conditions are
+        --    met, iterate for up-control solution. Enter P65 when the
+        --    constant drag controller has brought predicted range
+        --    within 25 nm of desired range.
+        -- 3. If no up-control solution exists with VL > 18000 fps,
+        --    skip to P67.
+        -- 4. Otherwise continue in constant drag mode (INITROLL).
+}
+
+rule P64SkipToFinal {
+    -- Velocity too low at 0.2g for up-control. Skip directly to P67.
+    when: VelocityBelowThresholdAt02g()
+
+    requires:
+        entry_sequence.current_program = p64
+
+    ensures:
+        entry_sequence.current_program = p67
+        entry_sequence.guidance_mode = final_phase
+        DisplayDsky(verb: 6, noun: 66)
+
+    @guidance
+        -- When V < 27000 fps at 0.2g, up-control is not feasible.
+        -- Entry guidance skips directly to the final phase (P67),
+        -- bypassing P65 and P66. This path also fires if no
+        -- up-control solution exists with VL > 18000 fps.
+}
+
+-- P65: Up-control range correction ------------------------------
+
+rule P65UpControl {
+    -- Entered via RTB when predicted range is within 25 nm of target.
+    -- Changes entry guidance mode to UPCONTRL for range correction
+    -- steering.
+    when: RangeWithinThreshold(threshold_nm: config.upcontrol_range_threshold_nm)
+
+    requires:
+        entry_sequence.current_program = p64
+
+    ensures:
+        entry_sequence.current_program = p65
+        entry_sequence.guidance_mode = upcontrol
+        DisplayDsky(verb: 16, noun: 69)
+
+    @guidance
+        -- P65 changes the entry mode to UPCONTRL via GOTOADDR.
+        -- It starts a separate job (PRIO13 via NOVAC) for the
+        -- flashing V16N69 display showing ROLLC, DL (Q7 drag
+        -- threshold) and VL (velocity limit).
+        --
+        -- Two phase changes are required to prevent restarting
+        -- the flashing display twice (4.55 spot and servicer).
+        --
+        -- REFAZE10 re-establishes the entry sequencer, then
+        -- control continues at UPCONTRL in the guidance loop.
+        --
+        -- P65 terminates via:
+        -- A) If D < Q7 fpss, go to P66 (low-drag trim).
+        -- B) If RDOT negative and V < VL + 500 fps, go to P67.
+}
+
+-- P66: Low-drag attitude trim -----------------------------------
+
+rule P66LowDragTrim {
+    -- Entered via RTB when drag falls below Q7. Trims CM attitude
+    -- to the relative velocity vector. Entry guidance suspends roll
+    -- commands until drag builds back up to Q7 + 0.5 fpss.
+    when: DragBelowQ7()
+
+    requires:
+        entry_sequence.current_program = p65
+
+    ensures:
+        entry_sequence.current_program = p66
+        entry_sequence.guidance_mode = kepler
+        DisplayDsky(verb: 6, noun: 22)
+
+    @guidance
+        -- P66 displays V06N22 (outer gimbal angle, inner gimbal
+        -- angle, middle gimbal angle) showing the CM body attitude.
+        --
+        -- During P66 the entry guidance stops generating roll
+        -- commands. The CM holds trim attitude relative to the
+        -- velocity vector. When drag exceeds Q7 + 0.5 fpss,
+        -- guidance resumes and transitions to P67 (KEP2 path).
+        --
+        -- P66 shares the P66END code path with P67, which disables
+        -- group 4 and sets ENTRYDSP for display via OVERNOUT.
+}
+
+-- P67: Steering termination -------------------------------------
+
+rule P67SteeringTermination {
+    -- Entered via RTB when CM velocity relative to Earth reaches
+    -- 1000 fps. Terminates entry guidance steering.
+    when: VelocityReachesThreshold(velocity_fps: config.final_phase_velocity_fps)
+
+    requires:
+        entry_sequence.current_program = p66
+        or entry_sequence.current_program = p65
+        or entry_sequence.current_program = p64
+
+    ensures:
+        entry_sequence.current_program = p67
+        entry_sequence.guidance_mode = final_phase
+        DisplayDsky(verb: 6, noun: 66)
+
+    @guidance
+        -- P67 displays V06N66 (ROLLC, cross-range error XRNGERR,
+        -- down-range error DNRNGERR) each pass through steering.
+        -- Restart protection is via the steering loop.
+        --
+        -- P67 disables group 4 (KILLGRP4) in case it came from
+        -- HUNTEST, then continues at PREDICT3 via DANZIG.
+}
+
+rule P67FinalDisplay {
+    -- After steering terminates, P67 displays range to go, latitude
+    -- and longitude (V16N67) and waits for crew input.
+    when: SteeringComplete()
+
+    requires:
+        entry_sequence.current_program = p67
+
+    ensures:
+        DisplayDsky(verb: 16, noun: 67)
+        DisableEntryDap()
+        ExitToPooh()
+
+    @guidance
+        -- V16N67 displays RTOGO, LAT, LONG. The crew can press
+        -- PRO to proceed or V to redo the display.
+        --
+        -- On proceed, P67 turns off the entry DAP by clearing
+        -- CM/DSTBY and GAMDIFSW in CM/FLAGS, then sets AVEGEXIT
+        -- to SERVCAD2 and goes to POOH. This ends the entry
+        -- guidance sequence entirely.
+        --
+        -- P67.2 calculates present latitude, longitude and altitude
+        -- from the state vector (RN) at PIPTIME, using LAT-LONG
+        -- with LUNAFLAG clear and ERADFLAG clear (pad radius for
+        -- altitude, though the display is not seen at this point).
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant SequentialProgression {
+    -- Entry programs execute in sequence, though P64 and P65 can
+    -- skip to P67 under specific conditions. Enforced by the
+    -- transitions block on current_program.
+    for seq in EntrySequences:
+        seq.committed implies seq.current_program != p61 or seq.current_program = p61
+}
+
+invariant NoAbortAfterCommit {
+    -- Once committed to entry there is no abort option.
+    for seq in EntrySequences:
+        seq.committed implies seq.current_program != null
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred EntrySequence.CheckStateVectorAndImu    -- see: Comanche055/P61-P67.agc (S61.1)
+    -- Checks AVERAGEG state, updates state vector if needed,
+    -- verifies IMU Y axis alignment within 30 degrees of velocity
+    -- vector. Raises alarm 01426 or 01427 on failure.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred EntrySequence.CalculateDesiredGimbalAngles    -- see: Comanche055/P61-P67.agc (S62.3)
+    -- Calculates gimbal angles for entry conditions at current
+    -- RN, VN. Called from CM/POSE and during Kepler phase.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred EntrySequence.StartEntryDap    -- see: cm_autopilots.allium (CM/DAPIC, CM/DAPON)
+    -- Starts CM/POSE and body rate calculation. Disables RCS DAP,
+    -- enables entry DAP with attitude hold.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred EntrySequence.InitialiseEntryEquations    -- see: Comanche055/REENTRY_CONTROL.agc (STARTENT)
+    -- Initialises entry guidance variables (LAD, LOD, target vector,
+    -- initial bank angle) and starts the entry DAP steering loop.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred EntrySequence.CommandSeparationPyro    -- see: Comanche055/P61-P67.agc
+    -- Issues pyrotechnic commands for CM/SM separation via
+    -- discrete output channels.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred EntrySequence.DisableEntryDap    -- see: Comanche055/P61-P67.agc (P67.1)
+    -- Clears CM/DSTBY and GAMDIFSW in CM/FLAGS to turn off
+    -- the entry DAP. Sets AVEGEXIT to SERVCAD2.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "P62 separation confirmation is by timeout alone. The AGC has no feedback sensor for mechanical separation. If separation fails, the crew must intervene manually. Should the spec model a separation failure path, or is this purely outside AGC control?"
+
+open question "P64's transition logic branches on velocity at 0.2g and on whether an up-control solution exists. The exact conditions for 'no up-control solution exists with VL > 18000 fps' need tracing through REENTRY_CONTROL to fully specify. The current spec captures the documented exit paths from the P64 source comments but not the detailed arithmetic."
+
+open question "P66's transition back to active guidance when drag exceeds Q7 + 0.5 fpss: does this always lead to P67, or can it re-enter P65's UPCONTRL mode? The source comment says 'continue at KEP2', suggesting the Kepler phase, which would then fall through to P67. But the exact sequencer path through REENTRY_CONTROL needs verification."

@@ -1,0 +1,719 @@
+-- allium: 3
+-- Apollo Guidance Computer — Rendezvous navigation and tracking
+-- Programs P20-P25, P76, routines R30, R31, TPI search,
+-- sextant mark processing and measurement incorporation
+
+use "./navigation.allium" as navigation
+use "./executive.allium" as executive
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    rendezvous: RendezvousState
+    integration_state: IntegrationState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum RendezvousProgram { p20 | p21 | p22 | p23 | p24 | p25 | p76 }
+
+enum VehicleUpdate { this_vehicle | other_vehicle }
+
+enum MarkType { sextant | coas | vhf_ranging }
+
+-- allium-ignore allium.definition.unused
+enum TpiSearchOutcome { solution_found | no_solution }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value MarkData {
+    time: Decimal
+    shaft_angle: Decimal
+    trunnion_angle: Decimal
+    imu_cduy: Decimal
+    imu_cduz: Decimal
+    imu_cdux: Decimal
+    mark_type: MarkType
+
+    @guidance
+        -- Seven registers in MRKBUF2: TIME2, TIME1, CDUY,
+        -- optics shaft, CDUZ, optics trunnion, CDUX.
+        -- LODSAMPT snapshots TIME2/TIME1 at the instant of
+        -- the mark to preserve timing accuracy.
+}
+
+-- allium-ignore allium.definition.unused
+value OrbitParameters {
+    apoapsis_altitude: Decimal
+    periapsis_altitude: Decimal
+    time_to_perigee: Decimal
+    time_free_fall: Decimal
+
+    @guidance
+        -- Computed by SR30.1 via TFFCONMU and TFFRP/RA.
+        -- Heights are above the launch pad (Earth) or
+        -- lunar landing site (Moon). TFF is time to
+        -- intersect 300 kft (Earth) or 35 kft (Moon).
+}
+
+-- allium-ignore allium.definition.unused
+value RendezvousParameters {
+    range: Decimal
+    range_rate: Decimal
+    theta: Decimal
+    phi: Decimal
+
+    @guidance
+        -- R31 computes these from the two vehicle state
+        -- vectors. Range is magnitude of the LOS vector,
+        -- range rate is the projection of relative velocity
+        -- onto the LOS direction. Theta is the angle between
+        -- a body-axis direction and the LOS projected into
+        -- the local horizontal plane. Phi is the elevation.
+}
+
+-- allium-ignore allium.definition.unused
+value TpiSolution {
+    tpi_time: Decimal
+    tpi_delta_v: List<Decimal>
+    tpf_delta_v: List<Decimal>
+    total_delta_v: Decimal
+    elevation_angle: Decimal
+
+    @guidance
+        -- S17.2 iterates using the Lambert subroutine to
+        -- find the minimum total transfer velocity for TPI
+        -- and TPF manoeuvres, subject to a safe pericenter
+        -- constraint (85 nm Earth, 35000 ft Moon).
+}
+
+-- allium-ignore allium.definition.unused
+value DeltaV {
+    components: List<Decimal>
+    tig: Decimal
+
+    @guidance
+        -- Input in local vertical coordinates, transformed
+        -- to reference coordinates via the rotation matrix
+        -- computed from position and velocity at TIG.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity RendezvousState {
+    active_program: RendezvousProgram?
+    tracking_active: Boolean
+    update_target: VehicleUpdate
+    rendezvous_flag: Boolean
+    marks_taken: Integer
+    vhf_marks_incorporated: Integer
+
+    -- Mark buffer
+    current_mark: MarkData?
+    mark_buffer_valid: Boolean
+
+    -- Navigation filter state
+    w_matrix_initialised: Boolean
+
+    -- Coordination flags
+    preferred_tracking_attitude: Boolean
+    optics_tracking: Boolean
+
+    -- Sextant mark system reservation
+    mark_system_in_use: Boolean
+
+    @guidance
+        -- P20 is a long-running job (priority 14 during its
+        -- tracking loop, initially higher during integration).
+        -- It coordinates with R22 (mark processing, run as a
+        -- separate FINDVAC job at priority 26) and R61
+        -- (preferred tracking attitude).
+        --
+        -- RNDVZFLG, TRACKFLG, UPDATFLG, VEHUPFLG, PRFTRKAT
+        -- and TARG1FLG are the primary flags governing the
+        -- P20 tracking cycle.
+}
+
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    p20_tracking_priority: Integer = 14
+    r22_mark_processing_priority: Integer = 26
+    p20_initial_priority: Integer = 20
+    max_marks_per_cycle: Integer = 5
+    trunnion_bias_default: Decimal = 0.0
+    min_pericenter_earth: Decimal = 157420.0
+    min_pericenter_moon: Decimal = 10668.0
+    r61_attitude_settle_cycles: Integer = 3
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- P20: Rendezvous navigation ----------------------------
+
+rule P20Start {
+    -- Astronaut selects P20 via V37E20E. Initialises flags,
+    -- zeroes mark counters, integrates both state vectors to
+    -- current time (with W-matrix if previously initialised),
+    -- then spawns R22 mark processing and enters tracking loop.
+    when: P20Start()
+
+    requires:
+        not rendezvous.tracking_active
+
+    ensures:
+        rendezvous.active_program = p20
+        rendezvous.tracking_active = true
+        rendezvous.rendezvous_flag = true
+        rendezvous.marks_taken = 0
+        rendezvous.vhf_marks_incorporated = 0
+        rendezvous.update_target = other_vehicle
+        rendezvous.preferred_tracking_attitude = true
+        IntegrateStateVectors()
+        SpawnR22MarkProcessing()
+
+    @guidance
+        -- PROG20 calls R02BOTH (IMU status check), zeroes
+        -- TRKMKCNT and VHFCNT, sets PRFTRKAT, resets VEHUPFLG,
+        -- sets TRACKFLG, UPDATFLG, RNDVZFLG. Then loads time,
+        -- calls SETINTG, and integrates both vehicles via
+        -- INTEGRV. If RENDWFLG is set, the W-matrix is
+        -- integrated along with the state vector (DIM0FLAG set).
+        --
+        -- After integration, spawns R22 as a FINDVAC job at
+        -- priority 26 (PRIO26).
+}
+
+rule P20TrackingCycle {
+    -- The continuous tracking loop. Lowers priority to allow
+    -- Lambert and other programs to run, checks that tracking
+    -- and REFSMMAT flags are still set, computes preferred
+    -- tracking attitude via R61, points optics via R52, then
+    -- releases marks via MKRLEES.
+    when: P20TrackingCycle()
+
+    requires:
+        rendezvous.tracking_active
+        rendezvous.active_program = p20
+
+    ensures:
+        ComputePreferredAttitude()
+        PointOptics()
+        ReleaseMarks()
+
+    @guidance
+        -- PIKUP20 lowers to PRIO14, checks TRACKFLG (bit 5
+        -- of STATE+1) and REFSMFLG (bit 13 of STATE+3). If
+        -- either is clear, ends the job. Otherwise initialises
+        -- R61CNTR, calls R61CSM (preferred tracking attitude),
+        -- R52 (auto optics positioning), then MKRLEES to
+        -- signal the astronaut can take marks. Sets HOLDFLAG=1
+        -- to hold the current attitude.
+}
+
+rule P20Terminate {
+    -- P20 terminates when the astronaut selects P00 (V37E00E)
+    -- or keys V56E.
+    when: P20Terminate()
+
+    requires: rendezvous.active_program = p20
+
+    ensures:
+        rendezvous.tracking_active = false
+        rendezvous.active_program = null
+        rendezvous.rendezvous_flag = false
+
+    @guidance
+        -- Clearing TRACKFLG causes the next PIKUP20 iteration
+        -- to fall through to ENDOFJOB, naturally terminating
+        -- the tracking loop.
+}
+
+-- P21: Ground track determination -----------------------
+
+rule P21GroundTrack {
+    -- Predicts ground track of selected vehicle at a given
+    -- time. Displays latitude, longitude and altitude.
+    -- Astronaut can recycle, advancing by 10-minute increments.
+    when: P21GroundTrack(vehicle_option, target_time)
+
+    ensures:
+        rendezvous.active_program = p21
+        let state = integrate_to_time(vehicle_option, target_time)
+        let position = lat_long(state)
+        DisplayGroundTrack(
+            latitude: position.latitude,
+            longitude: position.longitude,
+            altitude: position.altitude
+        )
+
+    @guidance
+        -- PROG21 uses OPTION2 to select this or other vehicle.
+        -- First pass integrates via INTEGRV and saves a base
+        -- vector (P21BASER, P21BASEV, P21TIME). Subsequent
+        -- recycles integrate from the base vector via INTEGRVS,
+        -- avoiding full re-integration. P21FLAG tracks whether
+        -- the base vector has been established.
+        --
+        -- On recycle (V32E), adds 600 seconds (10 minutes) to
+        -- the display time and recomputes.
+}
+
+-- P22: Orbital navigation (landmark tracking) -----------
+
+rule P22LandmarkTracking {
+    -- Takes sextant marks on lunar surface landmarks for
+    -- orbit determination. Resets RNDVZFLG to distinguish
+    -- from rendezvous marking.
+    when: P22LandmarkTracking()
+
+    requires:
+        not rendezvous.rendezvous_flag
+
+    ensures:
+        rendezvous.active_program = p22
+        ComputeMiddleGimbalAngle()
+        SelectLandmarkType()
+        PointOpticsAtLandmark()
+        ProcessLandmarkMarks()
+
+    @guidance
+        -- PROG22 resets RNDVZFLG, checks IMU, computes the
+        -- middle gimbal angle between the Y-axis and V x R
+        -- in stable-member coordinates. Displays MGA via
+        -- V06N45. Supports known landmarks (lat/long/alt from
+        -- stored RLS), unknown landmarks (astronaut enters
+        -- via V06N89), and advanced orbit determination
+        -- (landmark code DE = 50-57 octal).
+        --
+        -- Mark index is set to 5, TARG2FLG is set for
+        -- landmark sighting, TARG1FLG cleared for non-LEM.
+}
+
+-- R21/R23: Sextant mark taking --------------------------
+
+rule R21SextantMark {
+    -- Performs sighting marks for rendezvous navigation.
+    -- R21 uses V51 flash for standard sextant marks.
+    -- R23 uses V54 for COAS backup marks with manual
+    -- shaft/trunnion entry.
+    when: R21SextantMark(mark_type)
+
+    requires:
+        rendezvous.tracking_active
+
+    ensures:
+        if mark_type = sextant:
+            RequestSextantMark()
+        if mark_type = coas:
+            RequestCoasMark()
+        TransferMarkToBuffer()
+
+    @guidance
+        -- R21CSM sets R21MARK flag so that MARKRUPT stores
+        -- marks in MRKBUF1+2. When the astronaut proceeds,
+        -- the final mark is transferred to MRKBUF2 for R22
+        -- processing. MRKBUF1 is initialised to -1 (invalid).
+        --
+        -- R23 (COAS backup) displays shaft and trunnion via
+        -- V06N94 for manual entry. V53 requests the alternate
+        -- lost-sight mark. CDU angles and time are read
+        -- directly rather than through the mark interrupt.
+}
+
+-- R22: Mark processing (measurement incorporation) ------
+
+rule R22ProcessMark {
+    -- Spawned by P20 as a separate job. Takes the mark data
+    -- from MRKBUF2, computes the measurement geometry
+    -- (B-vector), and calls the navigation filter to update
+    -- the state vector.
+    when: R22ProcessMark(mark)
+
+    requires:
+        rendezvous.mark_buffer_valid
+        mark != null
+
+    ensures:
+        let geometry = compute_b_vector(mark)
+        MeasurementIncorporation(
+            b_vector: geometry.b_vector,
+            variance: geometry.variance,
+            measured_deviation: geometry.delta_q
+        )
+        rendezvous.marks_taken = rendezvous.marks_taken + 1
+
+    @guidance
+        -- R22 is a FINDVAC job at priority 26, higher than
+        -- the P20 tracking loop. It processes each mark as
+        -- it arrives in MRKBUF2. The B-vector is a partial
+        -- derivative of the measurement with respect to the
+        -- state vector, computed from optics geometry and
+        -- the predicted line-of-sight direction.
+}
+
+-- Measurement incorporation (navigation filter) ---------
+
+rule MeasurementIncorporation {
+    -- The Kalman-type navigation filter. Uses the W-matrix
+    -- (error transition matrix), the B-vector and the
+    -- measured deviation to compute state vector corrections.
+    when: MeasurementIncorporation(b_vector, variance, measured_deviation)
+
+    requires:
+        rendezvous.w_matrix_initialised
+
+    ensures:
+        let filter_result = incorporate_measurement(
+            b_vector: b_vector,
+            variance: variance,
+            delta_q: measured_deviation,
+            w_matrix: integration_state.w_matrix_enabled
+        )
+        ApplyStateVectorDeviation(
+            delta_x: filter_result.delta_x,
+            target: rendezvous.update_target
+        )
+
+    @guidance
+        -- INCORP1 computes ZI = B * W (matrix-vector products
+        -- for each 3-vector partition), then GAMMA and OMEGA
+        -- (the weighting vector). DELTAX = OMEGA * (DELTAQ/A)
+        -- where A = ZI^2 + VARIANCE. The filter dimension is
+        -- controlled by DMENFLG: 6 for position/velocity only,
+        -- 9 when radar or landmark bias is included.
+        --
+        -- INCORP2 updates the W-matrix itself, completing the
+        -- filter cycle. The W-matrix is 6x6 or 9x9 stored
+        -- as 54 or 81 DP words starting at erasable label W.
+}
+
+-- SXTMARK: Mark system reservation ----------------------
+
+rule SxtmarkReserve {
+    -- Reserves the sextant mark system. Called by routines
+    -- that need the astronaut to take marks.
+    when: SxtmarkReserve(mark_count)
+
+    requires:
+        not rendezvous.mark_system_in_use
+
+    ensures:
+        rendezvous.mark_system_in_use = true
+        AllocateMarkVacArea(mark_count: mark_count)
+
+    @guidance
+        -- SXTMARK checks bits 2 and 3 of EXTVBACT under
+        -- INHINT. If either is set (marking system in use or
+        -- extended verb in progress), it cannot proceed.
+        -- Otherwise it searches for a free VAC area, sets
+        -- MARKSTAT with the mark count in bits 14-12 and the
+        -- VAC area address in the lower bits.
+}
+
+rule SxtmarkBusy {
+    -- Mark system is already in use.
+    when: SxtmarkReserve(mark_count)
+
+    requires:
+        rendezvous.mark_system_in_use
+
+    ensures: Bailout(alarm_code: `01211`)
+
+    @guidance
+        -- If bits 2 or 3 of EXTVBACT are set, the mark
+        -- system cannot be reserved. R57 (optics calibration)
+        -- uses alarm 01211 for this case.
+}
+
+-- P76: Target delta-V -----------------------------------
+
+rule P76TargetDeltaV {
+    -- Accepts a delta-V and TIG for the other vehicle.
+    -- Integrates the other vehicle state vector to TIG,
+    -- applies the delta-V (transformed from local vertical
+    -- to reference coordinates), then integrates both vehicles
+    -- to the same time.
+    when: P76TargetDeltaV(delta_v, tig)
+
+    requires:
+        not integration_state.locked
+
+    ensures:
+        let other_state = integrate_to_time(other_vehicle, tig)
+        let ref_delta_v = lv_to_ref(delta_v, other_state)
+        let updated_velocity = other_state.velocity + ref_delta_v
+        ApplyVelocityUpdate(
+            vehicle: other_vehicle,
+            velocity: updated_velocity,
+            time: tig
+        )
+        SynchroniseStateVectors()
+        rendezvous.marks_taken = 0
+        rendezvous.vhf_marks_incorporated = 0
+        rendezvous.mark_buffer_valid = false
+
+    @guidance
+        -- P76 flashes V06N84 for delta-V, then V06N33 for
+        -- TIG. Calls OTHPREC to integrate to TIG, computes
+        -- the local-vertical-to-reference rotation matrix
+        -- from RATT and VATT (U(-R), U(VxR), U((RxV)xR)),
+        -- post-multiplies delta-V by this matrix. Calls
+        -- INTSTALL before updating to prevent interference.
+        --
+        -- After updating the other vehicle, INTEGRVS
+        -- integrates it to the time of this vehicle's state
+        -- vector, ensuring both states and the W-matrix
+        -- correspond to the same epoch. Clears MARKCTR,
+        -- VHFCNT and invalidates MRKBUF2.
+}
+
+-- R30: Orbit parameter display --------------------------
+
+rule R30OrbitParameters {
+    -- Computes and displays orbital parameters (apoapsis,
+    -- periapsis heights, time to perigee, time of free fall)
+    -- for the selected vehicle. Invoked by Verb 82.
+    when: R30OrbitParameters(vehicle_option)
+
+    ensures:
+        let state = get_or_integrate_state(vehicle_option)
+        let params = compute_orbit_parameters(state)
+        DisplayOrbitParameters(
+            apoapsis: params.apoapsis_altitude,
+            periapsis: params.periapsis_altitude,
+            time_free_fall: params.time_free_fall,
+            time_to_perigee: params.time_to_perigee
+        )
+
+    @guidance
+        -- V82CALL: if average-G is off, the astronaut selects
+        -- a vehicle via V04N06, the state vector is updated
+        -- by THISPREC or OTHPREC, then SR30.1 computes the
+        -- parameters. Display is V16N44 (HAPO, HPER, TFF)
+        -- with a 1-second monitor tick.
+        --
+        -- If average-G is on, SR30.1 runs approximately every
+        -- 2 seconds using the current vehicle state directly.
+        -- The state vector is not disturbed.
+}
+
+-- R31: Rendezvous parameter display ---------------------
+
+rule R31RendezvousParameters {
+    -- Displays range, range-rate, theta and phi between the
+    -- two vehicles. Invoked by Verb 83.
+    when: R31RendezvousParameters()
+
+    ensures:
+        let params = compute_rendezvous_parameters()
+        DisplayRendezvousParameters(
+            range: params.range,
+            range_rate: params.range_rate,
+            theta: params.theta,
+            phi: params.phi
+        )
+
+    @guidance
+        -- R31CALL spawns V83CALL as a FINDVAC job at priority
+        -- 3. STATEXTP integrates both vehicles to present
+        -- time (or uses RN/VN if average-G is on). COMPDISP
+        -- computes range as |RATT - RONE|, range rate as
+        -- (VATT - VONE) dot unit(LOS). Theta is the angle
+        -- between a body axis and the LOS in the local
+        -- horizontal plane. Display is V16N54.
+        --
+        -- For the CM, the body axis is X (UNITX via THISAXIS).
+        -- Subsequent integrations use the saved base vectors
+        -- to avoid full re-integration on each display cycle.
+        -- INTSTALL coordinates with the integration routine.
+}
+
+-- TPI search --------------------------------------------
+
+rule TpiSearch {
+    -- Searches for the optimal Terminal Phase Initiation
+    -- time. Finds the minimum total delta-V transfer
+    -- trajectory subject to a safe pericenter constraint.
+    when: TpiSearch(tpi_time)
+
+    ensures:
+        let search_result = search_tpi_solution(tpi_time)
+        if search_result.outcome = solution_found:
+            TpiSearchResult(solution: search_result.solution)
+        if search_result.outcome = no_solution:
+            TpiSearchNoSolution()
+
+    @guidance
+        -- S17.1 extrapolates both vehicles to TPI time via
+        -- conic propagation (LEMCONIC, CSMCONIC), computes
+        -- the relative phase angle and altitude difference,
+        -- and selects the search sector.
+        --
+        -- S17.2 computes angular limits, uses TIME-THETA for
+        -- search boundaries, then iterates with the Lambert
+        -- subroutine (INITVEL) to find the velocities at TPI
+        -- and TPF. Exits when the convergence criteria are
+        -- met or when no solution exists in the sector.
+        --
+        -- Minimum pericenter: 85 nm (Earth), 35000 ft (Moon).
+        -- These are hardcoded as HPE and HPL in the source.
+}
+
+-- Stable orbit rendezvous (P38/P78) ---------------------
+
+rule StableOrbitRendezvous {
+    -- Computes delta-V for stable orbit intercept (SOI)
+    -- and stable orbit rendezvous (SOR) manoeuvres.
+    -- P38 when this vehicle is active, P78 when the other
+    -- vehicle is active.
+    when: StableOrbitRendezvous(tig, central_angle, delta_r, option)
+
+    ensures:
+        let solution = compute_stable_orbit_transfer(
+            tig: tig,
+            central_angle: central_angle,
+            delta_r: delta_r,
+            option: option
+        )
+        DisplayManoeuvre(
+            delta_v: solution.delta_v,
+            time_to_go: solution.time_to_go,
+            middle_gimbal_angle: solution.mga
+        )
+
+    @guidance
+        -- P38/P78 calculate the delta-V to put the active
+        -- vehicle on a transfer trajectory that intercepts the
+        -- passive vehicle orbit at a given separation distance
+        -- (DELTAR). Option 1 is SOI (transfer to intercept),
+        -- option 2 is SOR (insertion into the passive orbit).
+        --
+        -- For SOR, CENTANG may be respecified. DELTTIME and
+        -- TINT are carried forward from the SOI computation.
+}
+
+-- INTSTALL coordination ---------------------------------
+
+rule IntstallAcquire {
+    -- Acquires the integration lock. Programs that need to
+    -- update or read the state vector must call INTSTALL
+    -- first. If the integrator is busy, the calling job
+    -- sleeps until it becomes available.
+    when: IntstallAcquire(job)
+
+    requires: not integration_state.locked
+
+    ensures:
+        integration_state.locked = true
+
+    @guidance
+        -- INTSTALL checks the integration lock. If busy, it
+        -- puts the calling job to sleep. INTWAKE (called when
+        -- integration completes) wakes all sleeping jobs that
+        -- were waiting on INTSTALL.
+}
+
+rule IntstallBusy {
+    -- Integration is in progress. The calling job sleeps
+    -- until INTWAKE signals completion.
+    when: IntstallAcquire(job)
+
+    requires: integration_state.locked
+
+    ensures:
+        JobSleep(job: job)
+
+    @guidance
+        -- The job sleeps at the INTSTALL CADR. INTWAKE
+        -- iterates over sleeping jobs and wakes those whose
+        -- LOC matches INTSTALL's address.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant MarkBufferValidWhenProcessing {
+    -- R22 must not process an invalid mark buffer.
+    for mark in MarkDatas:
+        mark.mark_type != null implies rendezvous.mark_buffer_valid
+}
+
+invariant TrackingRequiresRendezvousFlag {
+    rendezvous.tracking_active implies rendezvous.rendezvous_flag
+}
+
+invariant WMatrixBeforeIncorporation {
+    -- The W-matrix must be initialised before any measurement
+    -- can be incorporated.
+    rendezvous.marks_taken > 0 implies rendezvous.w_matrix_initialised
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred RendezvousState.compute_b_vector    -- see: Comanche055/P20-P25.agc (R22)
+    -- Computes the measurement geometry (B-vector) from mark
+    -- data: optics angles, IMU CDU angles, and predicted
+    -- line-of-sight direction.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred RendezvousState.incorporate_measurement    -- see: Comanche055/MEASUREMENT_INCORPORATION.agc
+    -- INCORP1/INCORP2: Kalman filter update. Computes ZI,
+    -- GAMMA, OMEGA, DELTAX from B-vector, variance, and
+    -- W-matrix. Updates both the state vector deviation
+    -- and the W-matrix.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred RendezvousState.search_tpi_solution    -- see: Comanche055/TPI_SEARCH.agc
+    -- S17.1/S17.2: extrapolates both vehicles, selects a
+    -- search sector, iterates with Lambert to find minimum
+    -- total delta-V transfer within pericenter constraints.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred RendezvousState.compute_stable_orbit_transfer    -- see: Comanche055/STABLE_ORBIT.agc
+    -- Computes SOI/SOR transfer trajectory delta-V using
+    -- Lambert targeting with a specified central angle and
+    -- separation distance.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred RendezvousState.compute_rendezvous_parameters    -- see: Comanche055/R31.agc
+    -- COMPDISP: range, range-rate, theta, phi from two
+    -- vehicle state vectors. Uses STATEXTP for integration
+    -- and base vector management.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred RendezvousState.compute_orbit_parameters    -- see: Comanche055/R30.agc
+    -- SR30.1: apoapsis/periapsis radius and height, time
+    -- to perigee, time of free fall via TFFCONMU/TFFRP/RA.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred RendezvousState.lv_to_ref    -- see: Comanche055/P76.agc (COMPMAT)
+    -- Rotation matrix from local vertical to reference
+    -- coordinates: columns are U(-R), U(VxR), U((RxV)xR).
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "P20's tracking loop re-enters via PIKUP20 after ENDOFJOB from the R52/MKRLEES sequence. The mechanism by which the loop restarts is not a direct call but relies on the phase change table and restart logic. If a restart occurs mid-cycle, does the phase table entry at OCT 05022 guarantee that PIKUP20 resumes cleanly, or can a mark be lost between R52 completion and MKRLEES?"
+
+open question "MEASUREMENT_INCORPORATION supports both 6-dimensional (position/velocity) and 9-dimensional (position/velocity/bias) filter modes via DMENFLG. Under what conditions does P20 enable the 9-dimensional mode? The source sets DIM0FLAG in P20.1 when RENDWFLG is set, but the relationship between DIM0FLAG and DMENFLG is not immediately clear from the rendezvous code alone."
+
+open question "R31's STATEXTP saves base vectors (BASEOTP/BASEOTV for LM, BASETHP/BASETHV for CM) on the first pass, then uses them for subsequent integrations. If the state vector is updated by P20's navigation filter between R31 display cycles, the base vectors become stale. Is this acceptable because R31 is a display-only routine and the staleness is bounded by the display update period?"

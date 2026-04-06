@@ -1,0 +1,610 @@
+-- allium: 3
+-- LM Digital Autopilot (DAP)
+-- RCS attitude control, dead-band management, gimbal trim
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    dap: LmDap
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum DapMode { idle | attitude_hold | auto_manoeuvre | rate_control }
+
+enum VehicleConfig { descent | ascent | docked }
+
+enum BodyAxis { p | q | r }
+
+enum DeadbandSelect { narrow | wide | powered_flight }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value AxisRates {
+    p: Decimal
+    q: Decimal
+    r: Decimal
+}
+
+value JetCommand {
+    -- Firing command for one axis, duration-based
+    axis: BodyAxis
+    jets: Integer
+    duration: Decimal
+
+    invariant ValidJetCount {
+        jets >= 0 and jets <= 4
+    }
+}
+
+value DapParameters {
+    -- Astronaut-loadable DAP data (V48)
+    deadband: DeadbandSelect
+    rate_limit_p: Decimal
+    rate_limit_qr: Decimal
+}
+
+value OffsetAcceleration {
+    -- Estimated disturbance torques on Q and R axes
+    q: Decimal
+    r: Decimal
+    -- Resolved into non-orthogonal U and V axes for jet selection
+    u: Decimal
+    v: Decimal
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity JetQuad {
+    index: Integer
+    jets_available: Integer
+
+    invariant ValidQuad {
+        index >= 1 and index <= 4
+    }
+
+    invariant JetRange {
+        jets_available >= 0 and jets_available <= 4
+    }
+}
+
+entity LmDap {
+    mode: DapMode
+    vehicle_config: VehicleConfig
+    parameters: DapParameters
+    initialised: Boolean
+
+    -- Current body rates
+    rates: AxisRates
+
+    -- Attitude errors in body frame
+    error_p: Decimal
+    error_q: Decimal
+    error_r: Decimal
+
+    -- Dead-band width, scaled at 45 degrees
+    deadband_width: Decimal
+
+    -- Offset acceleration estimates (disturbance torques)
+    offset_accel: OffsetAcceleration
+
+    -- Jet acceleration authority, recomputed when mass or config changes.
+    -- Per-axis single-jet acceleration magnitude.
+    jet_accel_p: Decimal
+    jet_accel_q: Decimal
+    jet_accel_r: Decimal
+
+    -- Descent engine gimbal trim state (descent config only)
+    gts_active: Boolean
+    gts_permitted: Boolean
+
+    -- Pending jet commands per axis
+    command_p: JetCommand?
+    command_u: JetCommand?
+    command_v: JetCommand?
+
+    -- Quads
+    quads: Set<JetQuad>
+
+    -- Coupling coefficient between Q and R axes.
+    -- Non-zero when moments of inertia differ, causing cross-axis torque.
+    epsilon: Decimal
+
+    transitions mode {
+        idle -> attitude_hold
+        idle -> auto_manoeuvre
+        idle -> rate_control
+        attitude_hold -> idle
+        attitude_hold -> auto_manoeuvre
+        attitude_hold -> rate_control
+        auto_manoeuvre -> idle
+        auto_manoeuvre -> attitude_hold
+        rate_control -> idle
+        rate_control -> attitude_hold
+    }
+
+    @guidance
+        -- The DAP runs as a T5 interrupt task at ~100ms. DAPIDLER
+        -- checks mode select switch position and IMU readiness before
+        -- dispatching to the active control law. The P axis is handled
+        -- first, then U and V (non-orthogonal axes derived from Q and R
+        -- by rotation through the coupling coefficient epsilon).
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    dap_cycle_ms: Integer = 100
+    deadband_wide_deg: Decimal = 5.0
+    deadband_narrow_deg: Decimal = 0.3
+    deadband_powered_deg: Decimal = 1.0
+    max_epsilon: Decimal = 0.42265
+    jet_count: Integer = 16
+    quad_count: Integer = 4
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- DAP initialisation ----------------------------------------
+
+rule DapInitialise {
+    -- On fresh start or restart, DAPIDLER sets up a NOVAC job
+    -- for 1/ACCS to compute mass-dependent parameters. The DAP
+    -- remains idle until 1/ACCS completes and sets ACCSOKAY.
+    when: DapInitialise(dap)
+
+    requires: dap.initialised = false
+
+    ensures:
+        dap.rates = AxisRates(p: 0, q: 0, r: 0)
+        dap.error_p = 0
+        dap.error_q = 0
+        dap.error_r = 0
+        dap.offset_accel = OffsetAcceleration(q: 0, r: 0, u: 0, v: 0)
+        dap.command_p = null
+        dap.command_u = null
+        dap.command_v = null
+        dap.gts_active = false
+        RecomputeJetAuthority(dap: dap)
+
+    @guidance
+        -- STARTDAP zeroes all rate, error, offset and jet command
+        -- registers, then sets T5ADR to PAXIS and TIME5 to 100ms.
+        -- 1/ACCSET nulls offset estimates before calling 1/ACCS.
+}
+
+rule DapInitialiseComplete {
+    -- 1/ACCS has finished computing jet accelerations and
+    -- dead-band switch curves. The DAP is now ready to control.
+    when: RecomputeJetAuthority(dap)
+
+    ensures:
+        dap.initialised = true
+        dap.mode = idle
+
+    @guidance
+        -- The ACCSOKAY bit in DAPBOOLS is set at the end of 1/ACCS.
+        -- DAPIDLER checks this bit each cycle; until set, it idles.
+}
+
+-- DAPIDLER dispatch ------------------------------------------
+
+rule DapIdlerCycleOff {
+    -- Mode select switch is OFF (both bits 13 and 14 of channel 31
+    -- set). The DAP shuts down: clears all jet commands, commands
+    -- jets off, disables gimbal drives, and schedules itself again
+    -- in 100ms.
+    when: DapCycle(dap)
+
+    requires: dap.mode = idle
+
+    ensures:
+        dap.command_p = null
+        dap.command_u = null
+        dap.command_v = null
+        dap.gts_active = false
+        DapCycleScheduled(delay_ms: config.dap_cycle_ms)
+
+    @guidance
+        -- SHUTDOWN writes zero to channels 5 and 6 (jet commands),
+        -- clears BGIM23 bits in channel 12 (gimbal drives), then
+        -- sets T5 to return to DAPIDLER in 100ms.
+}
+
+rule DapIdlerCycleActive {
+    -- The DAP is active. DAPIDLER dispatches to the appropriate
+    -- control law based on current mode.
+    when: DapCycle(dap)
+
+    requires: dap.mode != idle
+
+    ensures:
+        if dap.mode = attitude_hold:
+            AttitudeHoldCycle(dap: dap)
+        if dap.mode = auto_manoeuvre:
+            AutoManoeuvreCycle(dap: dap)
+        if dap.mode = rate_control:
+            RateControlCycle(dap: dap)
+        DapCycleScheduled(delay_ms: config.dap_cycle_ms)
+}
+
+-- Mode transitions -------------------------------------------
+
+rule DapStartAttitudeHold {
+    -- Astronaut selects attitude hold. Current CDU angles become
+    -- the desired attitude; commanded rates are zeroed.
+    when: DapModeSelect(dap, mode: attitude_hold)
+
+    requires: dap.initialised = true
+
+    ensures:
+        dap.mode = attitude_hold
+        dap.error_p = 0
+        dap.error_q = 0
+        dap.error_r = 0
+        dap.rates = AxisRates(p: 0, q: 0, r: 0)
+
+    @guidance
+        -- ZATTEROR copies current CDU angles to desired angles
+        -- (CDUXD, CDUYD, CDUZD) and zeroes commanded rates and
+        -- attitude change registers.
+}
+
+rule DapStartAutoManoeuvre {
+    -- Guidance commands an automatic attitude manoeuvre by
+    -- supplying desired CDU angles and rates.
+    when: DapModeSelect(dap, mode: auto_manoeuvre)
+
+    requires: dap.initialised = true
+
+    ensures:
+        dap.mode = auto_manoeuvre
+}
+
+rule DapStartRateControl {
+    when: DapModeSelect(dap, mode: rate_control)
+
+    requires: dap.initialised = true
+
+    ensures:
+        dap.mode = rate_control
+}
+
+rule DapStop {
+    -- Astronaut switches mode select to OFF, or PGNCS control
+    -- is deselected (bit 10 of channel 30).
+    when: DapModeSelect(dap, mode: idle)
+
+    ensures:
+        dap.mode = idle
+        dap.command_p = null
+        dap.command_u = null
+        dap.command_v = null
+        dap.gts_active = false
+}
+
+-- Attitude hold control law -----------------------------------
+
+rule AttitudeHoldCycle {
+    -- Computes attitude error from CDU differences, applies
+    -- dead-band check, issues jet commands to null error and rate.
+    when: AttitudeHoldCycle(dap)
+
+    requires: dap.mode = attitude_hold
+
+    ensures:
+        DeadBandCheck(dap: dap, axis: p)
+        DeadBandCheck(dap: dap, axis: q)
+        DeadBandCheck(dap: dap, axis: r)
+        JetSelect(dap: dap)
+
+    @guidance
+        -- PAXIS handles the P axis first. Q and R errors are
+        -- resolved into U and V axes through the coupling
+        -- coefficients COEFFQ and COEFFR before jet selection.
+}
+
+-- Auto manoeuvre control law ----------------------------------
+
+rule AutoManoeuvreCycle {
+    -- Follows a guidance-commanded attitude profile. Computes
+    -- CDU rate (FINDCDUW) from desired attitude change, applies
+    -- rate limiting, then uses the same dead-band and jet-select
+    -- logic as attitude hold.
+    when: AutoManoeuvreCycle(dap)
+
+    requires: dap.mode = auto_manoeuvre
+
+    ensures:
+        DeadBandCheck(dap: dap, axis: p)
+        DeadBandCheck(dap: dap, axis: q)
+        DeadBandCheck(dap: dap, axis: r)
+        JetSelect(dap: dap)
+}
+
+-- Rate control law --------------------------------------------
+
+rule RateControlCycle {
+    -- Damps body rates toward commanded rates. No position
+    -- (attitude) hold; only rate errors drive jet commands.
+    when: RateControlCycle(dap)
+
+    requires: dap.mode = rate_control
+
+    ensures:
+        JetSelect(dap: dap)
+}
+
+-- Dead-band management ----------------------------------------
+
+rule DeadBandCheck {
+    -- Compares attitude error against the dead-band. If the error
+    -- is within the band, no jet command is issued for that axis.
+    -- The dead-band is asymmetric when offset accelerations are
+    -- present: the band shifts to reduce firings against the
+    -- disturbance torque direction.
+    --
+    -- Dead-band values are derived from the loaded DB parameter
+    -- by 1/ACCONT: DBVAL1 = DB, DBVAL2 = -0.75 DB,
+    -- DBVAL3 = 0.5 DB. Four separate thresholds (DB1..DB4) are
+    -- set per axis depending on the sign and magnitude of offset
+    -- acceleration, providing hysteresis.
+    when: DeadBandCheck(dap, axis)
+
+    ensures:
+        if axis = p:
+            if abs(dap.error_p) < dap.deadband_width:
+                dap.command_p = null
+        if axis = q:
+            if abs(dap.error_q) < dap.deadband_width:
+                dap.command_u = null
+        if axis = r:
+            if abs(dap.error_r) < dap.deadband_width:
+                dap.command_v = null
+
+    @guidance
+        -- The dead-band logic uses four thresholds per axis
+        -- (DBB1..DBB4) set by 1/ACCONT. When offset acceleration
+        -- exceeds AMIN (0.03 rad/s^2), the band shifts: the side
+        -- facing the disturbance widens, the opposite side narrows.
+        -- This reduces limit-cycle firings. When AOS is between
+        -- AMIN/2 and AMIN, a transitional band applies. Below
+        -- AMIN/2, the band is symmetric at the loaded DB width.
+}
+
+-- Jet selection -----------------------------------------------
+
+rule JetSelect {
+    -- Selects which jets to fire and for how long. The P axis
+    -- uses 2 or 4 jets depending on rate error magnitude and
+    -- vehicle config. The Q/R axes are resolved into U and V
+    -- (non-orthogonal axes rotated by the coupling coefficient)
+    -- and may use 1 or 2 jets per axis.
+    --
+    -- In descent config with large rate errors, 4-jet P-axis
+    -- firing is used (beyond the -2JETLIM threshold). In ascent
+    -- and docked configs, P axis always uses 2 jets.
+    when: JetSelect(dap)
+
+    ensures:
+        if dap.command_p != null:
+            if dap.vehicle_config = descent:
+                dap.command_p.jets <= 4
+            if dap.vehicle_config = ascent:
+                dap.command_p.jets <= 2
+        if dap.command_u != null:
+            dap.command_u.jets <= 2
+        if dap.command_v != null:
+            dap.command_v.jets <= 2
+
+    @guidance
+        -- Jet selection for Q/R is more complex than P because the
+        -- LM's offset CG means Q-axis jets produce R-axis torque
+        -- and vice versa. The coupling coefficient epsilon measures
+        -- the inertia asymmetry: epsilon = 1 - min(Iq,Ir)/max(Iq,Ir),
+        -- capped at 0.42265. COEFFQ and COEFFR rotate the Q/R
+        -- commands into U/V commands that account for this coupling.
+        --
+        -- For the docked case, COEFFQ = -0.707 and COEFFR = 0.707,
+        -- making U and V orthogonal regardless of inertia ratio.
+}
+
+-- Gimbal trim system (descent only) ---------------------------
+
+rule GtsActivate {
+    -- In descent config, the descent engine gimbal can trim out
+    -- steady-state disturbance torques on Q and R axes, leaving
+    -- RCS to handle transients only. GTS is activated when the
+    -- gimbal is usable (USEQRJTS set) and the DAP is running.
+    when: GtsEvaluate(dap)
+
+    requires:
+        dap.vehicle_config = descent
+        dap.gts_permitted = true
+        dap.mode != idle
+
+    ensures:
+        dap.gts_active = true
+
+    @guidance
+        -- ALLOWGTS and INGTS track whether GTS is near or active.
+        -- When GTS is in control, COTROLER routes Q/R-axis control
+        -- through the gimbal trim path (TRYGTS) rather than RCS.
+        -- The gimbal drives are timed by QGIMTIMR and RGIMTIMR.
+        -- ACCDOTQ/ACCDOTR represent the jerk (rate of change of
+        -- acceleration) due to gimbal rotation, computed from
+        -- thrust, moment arm and inertia.
+}
+
+rule GtsDeactivate {
+    when: GtsEvaluate(dap)
+
+    requires:
+        dap.vehicle_config != descent
+        or dap.gts_permitted = false
+        or dap.mode = idle
+
+    ensures:
+        dap.gts_active = false
+
+    @guidance
+        -- DOWNGTS ensures the gimbal switches are turned off when
+        -- GTS is not available. In ascent config, ALLOWGTS and INGTS
+        -- are zeroed during 1/ACCS initialisation.
+}
+
+-- Parameter recomputation ------------------------------------
+
+rule RecomputeJetAuthority {
+    -- When mass, vehicle config, dead-band or docked state changes,
+    -- 1/ACCS recomputes jet accelerations per axis as functions of
+    -- mass, sets dead-band switch curves, and updates coupling
+    -- coefficients.
+    when: RecomputeJetAuthority(dap)
+
+    ensures:
+        dap.jet_accel_p = compute_jet_accel(dap.vehicle_config, p)
+        dap.jet_accel_q = compute_jet_accel(dap.vehicle_config, q)
+        dap.jet_accel_r = compute_jet_accel(dap.vehicle_config, r)
+        if dap.vehicle_config != docked:
+            dap.epsilon = compute_epsilon(dap.jet_accel_q, dap.jet_accel_r)
+
+    @guidance
+        -- 1/ACCS uses curve fits of the form 1JACC = A/(MASS+C) + B
+        -- with separate coefficient sets for descent and ascent.
+        -- For the docked case, inertia is computed from a bivariate
+        -- polynomial in LEM mass and CSM mass, and jet acceleration
+        -- is a simple ratio 1JACCCON/MASS. Epsilon is capped at
+        -- 0.42265 to prevent the U/V rotation from diverging.
+}
+
+-- DAP data load (V48) ----------------------------------------
+
+rule DapDataLoad {
+    -- Astronaut loads DAP parameters via Verb 48. This sets
+    -- dead-band width and triggers 1/ACCS recomputation.
+    when: DapDataLoad(dap, params)
+
+    ensures:
+        dap.parameters = params
+        if params.deadband = wide:
+            dap.deadband_width = config.deadband_wide_deg
+        if params.deadband = narrow:
+            dap.deadband_width = config.deadband_narrow_deg
+        if params.deadband = powered_flight:
+            dap.deadband_width = config.deadband_powered_deg
+        RecomputeJetAuthority(dap: dap)
+
+    @guidance
+        -- SETMAXDB, SETMINDB, PFLITEDB each store the appropriate
+        -- scaled value in DB and set up a NOVAC job for 1/ACCJOB.
+        -- RESTORDB reads the DBSELECT bit of DAPBOOLS to determine
+        -- which dead-band the crew selected.
+}
+
+rule SetDeadbandOnAllcoast {
+    -- Engine-off or fresh start triggers ALLCOAST, which zeroes
+    -- offset estimates, sets drift mode, and restores the
+    -- crew-selected dead-band.
+    when: AllCoast(dap)
+
+    ensures:
+        dap.offset_accel = OffsetAcceleration(q: 0, r: 0, u: 0, v: 0)
+        dap.rates = AxisRates(p: 0, q: 0, r: 0)
+        RecomputeJetAuthority(dap: dap)
+
+    @guidance
+        -- ALLCOAST calls STOPRATE to clear the rate interface,
+        -- zeroes AOSQ, AOSR and downlist copies, sets DRIFTBIT,
+        -- then calls RESTORDB to re-establish the crew's dead-band.
+}
+
+-- Vehicle configuration change --------------------------------
+
+rule ConfigChangeToAscent {
+    -- After staging (descent stage jettisoned), the DAP switches
+    -- to ascent configuration. Jet accelerations change because
+    -- mass drops and CG shifts. GTS is no longer available.
+    when: VehicleStaging(dap)
+
+    requires: dap.vehicle_config = descent
+
+    ensures:
+        dap.vehicle_config = ascent
+        dap.gts_active = false
+        dap.gts_permitted = false
+        RecomputeJetAuthority(dap: dap)
+
+    @guidance
+        -- APSFLAG (bit in FLGWRD10) distinguishes descent from
+        -- ascent. 1/ACCS selects coefficient sets and mass limits
+        -- based on this flag. In ascent, -2JETLIM is set to POSMAX,
+        -- forcing 2-jet P-axis control exclusively.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant JetCommandsRequireActiveMode {
+    dap.mode = idle implies
+        dap.command_p = null
+        and dap.command_u = null
+        and dap.command_v = null
+}
+
+invariant GtsOnlyInDescent {
+    dap.gts_active implies dap.vehicle_config = descent
+}
+
+invariant DeadbandWithinLoadedParams {
+    dap.deadband_width = config.deadband_wide_deg
+        or dap.deadband_width = config.deadband_narrow_deg
+        or dap.deadband_width = config.deadband_powered_deg
+}
+
+invariant EpsilonBounded {
+    abs(dap.epsilon) <= config.max_epsilon
+}
+
+invariant InitialisedBeforeActive {
+    dap.mode != idle implies dap.initialised = true
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred LmDap.compute_jet_accel    -- see: Luminary099/AOSTASK_AND_AOSJOB.agc
+    -- Curve fit 1JACC = A/(MASS+C) + B with coefficient sets
+    -- indexed by vehicle config and axis. For docked config,
+    -- uses bivariate polynomial in LEM and CSM mass.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred LmDap.compute_epsilon    -- see: Luminary099/AOSTASK_AND_AOSJOB.agc
+    -- Epsilon = 1 - min(Iq,Ir)/max(Iq,Ir), capped at 0.42265.
+    -- Determines coupling between Q and R axes. Used to derive
+    -- COEFFQ and COEFFR for the U/V rotation.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The dead-band asymmetry logic in 1/ACCONT uses four thresholds (DBB1..DBB4) per axis, with the shift direction determined by the sign of offset acceleration. When offset acceleration reverses sign between DAP cycles, do the thresholds swap instantaneously or is there a lag from the Kalman filter estimate? The source uses AOSQ/AOSR directly, which are filtered values, but the filter time constant relative to the 100ms DAP cycle is not obvious from the code."
+
+open question "In docked configuration, 1/ACCS sets 1/ANET values for U and V axes to POSMAX, corresponding to a minimum acceleration of approximately 1.4 deg/s^2. This effectively disables the minimum-impulse zone for those axes. Is this intentional because the docked vehicle's large inertia makes minimum impulse control impractical, or is it a simplification that limits fine attitude control when docked?"
+
+open question "DAPIDLER checks both the mode select switch (channel 31 bits 13-14) and PGNCS control (channel 30 bit 10). If PGNCS control is deselected but the mode switch is not OFF, the DAP idles but still computes attitude errors for display. Is this a distinct operational mode (AGS control with PGNS error display) that deserves its own DapMode variant, or is it correctly modelled as idle with a separate display concern?"

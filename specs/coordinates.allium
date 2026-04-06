@@ -1,0 +1,473 @@
+-- allium: 3
+-- Apollo Guidance Computer — Coordinate systems and ephemerides
+-- Planetary orientation, ephemeris computation, vehicle geometry,
+-- geodetic/selenographic conversion, star catalogue
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum CentralBody { earth | moon }
+
+enum VehicleType { cm | lm }
+
+-- allium-ignore allium.definition.unused
+enum Frame { inertial | body_fixed | platform | navigation_base }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Vector3 {
+    x: Decimal
+    y: Decimal
+    z: Decimal
+}
+
+value Matrix3x3 {
+    rows: List<Vector3>
+
+    @guidance
+        -- Rotation and transformation matrices are stored as
+        -- 9 DP words (3x3). The interpreter's matrix operations
+        -- (MXV, VXM, VXSC) operate on this layout directly.
+}
+
+-- allium-ignore allium.definition.unused
+value GeodesicPosition {
+    latitude: Decimal
+    longitude: Decimal
+    altitude: Decimal
+
+    @guidance
+        -- For Earth: geodetic latitude accounts for oblateness.
+        -- For Moon: selenographic latitude and longitude on a
+        -- spherical reference surface.
+}
+
+value StarEntry {
+    catalogue_number: Integer
+    position: Vector3
+
+    @guidance
+        -- Star positions in the basic reference coordinate system
+        -- (mean equinox and equator of epoch). 37 stars in the
+        -- catalogue, selected for brightness and sky distribution
+        -- to ensure adequate pairs are visible from any attitude.
+}
+
+-- allium-ignore allium.definition.unused
+value EphemerisCoefficients {
+    body: CentralBody
+    epoch: Decimal
+    position_coefficients: List<Decimal>
+    velocity_coefficients: List<Decimal>
+
+    @guidance
+        -- Chebyshev polynomial coefficients for the position of
+        -- the Sun and Moon as functions of time relative to TEPHEM
+        -- (the pre-launch epoch). Coefficients are fixed constants
+        -- loaded into rope memory. Accuracy is limited by the
+        -- polynomial degree and the mission time span over which
+        -- the approximation is valid.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity PlanetaryOrientation {
+    -- Orientation of Earth or Moon in the basic reference frame
+    body: CentralBody
+    rotation_matrix: Matrix3x3
+    time: Decimal
+
+    -- Moon includes libration modelling
+    libration_angles: Vector3?
+
+    @guidance
+        -- Computes the transformation between body-fixed
+        -- coordinates and the inertial reference frame.
+        --
+        -- Earth: rotation about the polar axis, precession and
+        -- nutation terms approximated by low-order polynomials.
+        --
+        -- Moon: rotation plus physical libration in longitude,
+        -- latitude and node. The libration model uses the same
+        -- polynomial epoch as the ephemerides (TEPHEM). Libration
+        -- is essential for accurate lunar surface position work
+        -- (landing site targeting, landmark tracking).
+}
+
+entity Ephemeris {
+    -- Positions of the Sun and Moon at a given time
+    sun_position: Vector3
+    moon_position: Vector3
+    time: Decimal
+
+    @guidance
+        -- Evaluated from pre-computed polynomial coefficients.
+        -- Sun and Moon positions are needed for:
+        -- 1. Third-body gravitational perturbations in integration
+        -- 2. Targeting and rendezvous geometry
+        -- 3. Attitude determination (Sun/Moon sightings)
+        --
+        -- Accuracy degrades as time departs from the TEPHEM epoch.
+        -- For Apollo missions the valid span was roughly ±2 weeks
+        -- from the nominal launch date.
+}
+
+entity VehicleGeometry {
+    -- Vehicle-specific coordinate frame definitions
+    vehicle_type: VehicleType
+
+    -- Transforms between frames
+    body_to_nav_base: Matrix3x3
+    nav_base_to_platform: Matrix3x3
+
+    -- The REFSMMAT connects platform to inertial frame
+    refsmmat: Matrix3x3?
+
+    @guidance
+        -- The transformation chain is:
+        -- body frame -> navigation base -> IMU stable member -> inertial
+        --
+        -- REFSMMAT (reference stable member matrix) is computed
+        -- during IMU alignment from star sightings. It encodes
+        -- the orientation of the IMU platform relative to the
+        -- inertial reference frame. All navigation computations
+        -- that involve the IMU pass through this matrix.
+        --
+        -- The nav base is a physical mounting point on the vehicle
+        -- with known mechanical alignment to the body frame.
+}
+
+-- allium-ignore allium.entity.unused
+entity CmGeometry {
+    -- CM-specific optical instruments
+    geometry: VehicleGeometry
+
+    -- Sextant and scanning telescope pointing
+    sextant_shaft_angle: Decimal
+    sextant_trunnion_angle: Decimal
+    telescope_shaft_angle: Decimal
+    telescope_trunnion_angle: Decimal
+
+    @guidance
+        -- The sextant (SXT) has a fixed line of sight and a
+        -- movable mirror controlled by shaft and trunnion angles.
+        -- The scanning telescope (SCT) provides a wider field for
+        -- acquisition. Both mount on the navigation base.
+        --
+        -- Star sightings through the sextant provide the data
+        -- for IMU alignment (P51/P52). The optics geometry defines
+        -- the transformation from shaft/trunnion angles to a line
+        -- of sight vector in the navigation base frame.
+}
+
+-- allium-ignore allium.entity.unused
+entity LmGeometry {
+    -- LM-specific optical and radar instruments
+    geometry: VehicleGeometry
+
+    -- Alignment Optical Telescope
+    aot_detent: Integer
+    aot_azimuth: Decimal
+    aot_elevation: Decimal
+
+    -- Landing radar geometry
+    landing_radar_position: Vector3
+    landing_radar_antenna_angle: Decimal
+
+    @guidance
+        -- The AOT (Alignment Optical Telescope) is a fixed-head
+        -- periscope with discrete detent positions. Each detent
+        -- defines a known line of sight in the LM body frame.
+        -- Star sightings through the AOT are used for LM IMU
+        -- alignment (P57).
+        --
+        -- The landing radar antenna is canted relative to the LM
+        -- body frame. Its geometry defines the transformation from
+        -- radar measurements (slant range, velocity components)
+        -- to the navigation frame. The antenna has two positions
+        -- (position 1 for descent, position 2 for hover) with
+        -- different boresight angles.
+}
+
+-- allium-ignore allium.entity.unused
+entity StarCatalogue {
+    -- Navigation star catalogue
+    stars: List<StarEntry>
+    star_count: Integer
+
+    @guidance
+        -- 37 stars in the basic reference coordinate system.
+        -- Used by both CM (sextant sightings) and LM (AOT
+        -- sightings) for IMU alignment. The catalogue is in
+        -- rope memory and cannot be updated in flight.
+        --
+        -- Stars are selected for brightness (visual magnitude),
+        -- sky distribution (coverage of the celestial sphere) and
+        -- separation (pairs with sufficient angular separation for
+        -- accurate platform alignment).
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    star_catalogue_size: Integer = 37
+    earth_flattening: Decimal = 0.003353
+    moon_radius: Decimal = 1738090.0
+    earth_equatorial_radius: Decimal = 6378166.0
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Ephemeris computation ------------------------------------
+
+rule ComputeEphemeris {
+    -- Evaluate Sun and Moon positions at a given time from
+    -- polynomial coefficients.
+    when: ComputeEphemeris(time, coefficients)
+
+    ensures:
+        let ephemeris = Ephemeris.created(
+            sun_position: evaluate_polynomial(coefficients.sun, time),
+            moon_position: evaluate_polynomial(coefficients.moon, time),
+            time: time
+        )
+
+    @guidance
+        -- Polynomial evaluation uses nested multiplication
+        -- (Horner's method) in interpretive code. The coefficients
+        -- are relative to TEPHEM, so the input time is first
+        -- converted to time-since-epoch.
+}
+
+-- Planetary orientation ------------------------------------
+
+rule ComputePlanetaryOrientation {
+    -- Compute the body-fixed to inertial rotation matrix for
+    -- Earth or Moon at a given time.
+    when: ComputePlanetaryOrientation(body, time)
+
+    ensures:
+        if body = moon:
+            PlanetaryOrientation.created(
+                body: body,
+                rotation_matrix: compute_lunar_orientation(time),
+                time: time,
+                libration_angles: compute_libration(time)
+            )
+        else:
+            PlanetaryOrientation.created(
+                body: body,
+                rotation_matrix: compute_earth_orientation(time),
+                time: time,
+                libration_angles: null
+            )
+}
+
+-- Frame transformations ------------------------------------
+
+rule BodyToInertial {
+    -- Transform a vector from vehicle body frame to inertial frame.
+    when: BodyToInertial(vector, geometry)
+
+    requires: geometry.refsmmat != null
+
+    ensures:
+        let nav_base = geometry.body_to_nav_base * vector
+        let platform = geometry.nav_base_to_platform * nav_base
+        let inertial = geometry.refsmmat * platform
+        FrameTransformResult(vector: inertial, frame: inertial)
+
+    @guidance
+        -- Three sequential matrix-vector multiplications through
+        -- the transformation chain. Each matrix is 3x3, each
+        -- vector 3 DP words. Uses the interpreter's MXV operation.
+}
+
+rule InertialToBody {
+    -- Transform a vector from inertial frame to vehicle body frame.
+    when: InertialToBody(vector, geometry)
+
+    requires: geometry.refsmmat != null
+
+    ensures:
+        let platform = transpose(geometry.refsmmat) * vector
+        let nav_base = transpose(geometry.nav_base_to_platform) * platform
+        let body = transpose(geometry.body_to_nav_base) * nav_base
+        FrameTransformResult(vector: body, frame: body_fixed)
+
+    @guidance
+        -- Inverse transformation: transpose of each rotation matrix
+        -- applied in reverse order. Rotation matrices are orthogonal,
+        -- so the inverse equals the transpose.
+}
+
+-- Geodetic/selenographic conversion ------------------------
+
+rule LatLongFromPosition {
+    -- Convert a Cartesian position vector to geodetic (Earth)
+    -- or selenographic (Moon) coordinates.
+    when: LatLongFromPosition(position, body)
+
+    ensures:
+        if body = earth:
+            LatLongResult(position: geodetic_from_cartesian(position, config.earth_equatorial_radius, config.earth_flattening))
+        else:
+            LatLongResult(position: selenographic_from_cartesian(position, config.moon_radius))
+
+    @guidance
+        -- Earth: iterative geodetic latitude computation accounting
+        -- for the WGS-equivalent ellipsoid (Fischer 1960). The
+        -- iteration converges in 2-3 steps for normal altitudes.
+        --
+        -- Moon: treated as a sphere. Selenographic latitude and
+        -- longitude are computed directly from the Cartesian
+        -- components without iteration.
+}
+
+rule PositionFromLatLong {
+    -- Convert geodetic/selenographic coordinates to a Cartesian
+    -- position vector.
+    when: PositionFromLatLong(geo, body)
+
+    ensures:
+        if body = earth:
+            PositionResult(position: cartesian_from_geodetic(geo, config.earth_equatorial_radius, config.earth_flattening))
+        else:
+            PositionResult(position: cartesian_from_selenographic(geo, config.moon_radius))
+}
+
+-- Star sighting --------------------------------------------
+
+rule StarSighting {
+    -- Compute the expected line of sight to a catalogue star
+    -- in the vehicle's instrument frame, or process an observed
+    -- sighting to update the REFSMMAT.
+    when: StarSighting(star, geometry)
+
+    requires: star.catalogue_number >= 1 and star.catalogue_number <= config.star_catalogue_size
+
+    ensures:
+        let los_inertial = star.position
+        let los_body = InertialToBody(vector: los_inertial, geometry: geometry.geometry)
+        StarSightingResult(line_of_sight: los_body)
+
+    @guidance
+        -- For IMU alignment, two star sightings are taken. The
+        -- measured lines of sight (from sextant or AOT angles)
+        -- are compared with the known catalogue positions to
+        -- compute the REFSMMAT that best aligns the platform
+        -- orientation to the inertial frame.
+        --
+        -- The alignment algorithm (SXTNB, AXISROT) uses the
+        -- cross product of two star vectors to establish three
+        -- orthogonal axes, then constructs the rotation matrix.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant StarCatalogueSize {
+    for catalogue in StarCatalogues:
+        catalogue.star_count = config.star_catalogue_size
+}
+
+invariant RefsmmmatOrthogonality {
+    -- REFSMMAT must be a proper rotation matrix.
+    for geom in VehicleGeometrys:
+        geom.refsmmat != null implies is_orthogonal(geom.refsmmat)
+}
+
+------------------------------------------------------------
+-- Implementation notes
+------------------------------------------------------------
+
+-- Interpretive code
+--
+-- All coordinate transformation and ephemeris routines run in
+-- interpretive code, using the interpreter's matrix and vector
+-- operations (MXV, VXM, VXSC, V/SC, DOT, UNIT, ABVAL). This
+-- is necessary because these operations require double-precision
+-- arithmetic on multi-word quantities that would be prohibitively
+-- complex in basic (native) code.
+
+-- Ephemeris accuracy
+--
+-- The polynomial approximations are pre-computed for the mission
+-- epoch and loaded as fixed constants in rope memory. Accuracy
+-- degrades with distance from TEPHEM. The coefficients were
+-- generated by JPL from high-fidelity ephemeris models and
+-- truncated to fit the available precision (DP words, roughly
+-- 28 bits of mantissa).
+
+-- REFSMMAT
+--
+-- The REFSMMAT is not a constant; it is computed during each
+-- IMU alignment and stored in erasable memory. Different programs
+-- may use different REFSMMAT definitions (launch pad, local
+-- vertical, preferred landing site). The matrix connects all
+-- IMU-referenced measurements to the inertial frame and is
+-- therefore critical to every navigation computation.
+
+-- CM/LM geometry differences
+--
+-- CM: sextant and scanning telescope are shaft/trunnion gimballed
+-- instruments with continuous angular readout. The optics CDU
+-- (coupling display unit) provides digital shaft and trunnion
+-- angles to the computer.
+--
+-- LM: the AOT is a fixed-head instrument with 6 detent positions.
+-- Each detent has a known azimuth and elevation in the LM body
+-- frame. Star sightings are taken by timing when a star crosses
+-- the AOT reticle pattern, constraining the possible attitudes.
+-- The LM also has landing radar geometry that transforms radar
+-- measurements to the navigation frame.
+
+------------------------------------------------------------
+-- Deferred specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Ephemeris.evaluate_polynomial    -- see: Comanche055/LUNAR_AND_SOLAR_EPHEMERIDES_SUBROUTINES.agc
+    -- Chebyshev polynomial evaluation using Horner's method.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PlanetaryOrientation.compute_lunar_orientation    -- see: Comanche055/PLANETARY_INERTIAL_ORIENTATION.agc
+    -- Lunar rotation matrix including precession and libration.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PlanetaryOrientation.compute_libration    -- see: Comanche055/PLANETARY_INERTIAL_ORIENTATION.agc
+    -- Physical libration angles (longitude, latitude, node).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred PlanetaryOrientation.compute_earth_orientation    -- see: Comanche055/PLANETARY_INERTIAL_ORIENTATION.agc
+    -- Earth rotation matrix including precession and nutation.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred GeodesicPosition.geodetic_from_cartesian    -- see: Comanche055/LATITUDE_LONGITUDE_SUBROUTINES.agc
+    -- Iterative geodetic latitude for oblate Earth.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred GeodesicPosition.selenographic_from_cartesian    -- see: Comanche055/LATITUDE_LONGITUDE_SUBROUTINES.agc
+    -- Selenographic coordinates on spherical Moon.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred GeodesicPosition.cartesian_from_geodetic    -- see: Comanche055/LATITUDE_LONGITUDE_SUBROUTINES.agc
+    -- Cartesian position from geodetic coordinates.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred GeodesicPosition.cartesian_from_selenographic    -- see: Comanche055/LATITUDE_LONGITUDE_SUBROUTINES.agc
+    -- Cartesian position from selenographic coordinates.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred VehicleGeometry.is_orthogonal    -- see: runtime check
+    -- Verify a matrix is a proper rotation (det = +1, M^T M = I).

@@ -1,0 +1,725 @@
+-- allium: 3
+-- Apollo Guidance Computer — LM guidance and engine control
+-- Landing guidance (P63/P64/P65/P66), ascent guidance (P12),
+-- master ignition routine, throttle control, trim gimbal control
+-- Source: Luminary099
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    servicer: Servicer
+    landing_guidance: LandingGuidanceState
+    ascent_guidance: AscentGuidanceState
+    throttle: ThrottleState
+    trim_gimbal: TrimGimbalState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum LandingPhase {
+    ignition_algorithm
+    | braking
+    | approach
+    | vertical
+}
+
+enum GuidanceMode { landing | ascent | external_delta_v }
+
+enum EngineId { descent | ascent }
+
+enum EngineState { off | ullage | running | shutdown }
+
+-- allium-ignore allium.definition.unused
+enum RodDirection { increase | decrease }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value PipaReading {
+    -- Pulsed integrating pendulous accelerometer output
+    delta_v_x: Decimal
+    delta_v_y: Decimal
+    delta_v_z: Decimal
+
+    @guidance
+        -- PIPAs produce velocity increments per cycle. SERVICER
+        -- reads PIPAX, PIPAY, PIPAZ and zeroes them. The readings
+        -- accumulate between SERVICER cycles (approximately 2 seconds).
+}
+
+-- allium-ignore allium.definition.unused
+value GuidanceCommand {
+    -- Output of the guidance equations: commanded thrust direction
+    -- and throttle setting
+    thrust_direction: List<Decimal>
+    throttle_fraction: Decimal
+
+    @guidance
+        -- thrust_direction is a unit vector in stable-member
+        -- coordinates. throttle_fraction is 0.0 to 1.0 representing
+        -- the commanded percentage of full thrust.
+}
+
+value FlightSequenceEntry {
+    -- One row of the flight sequence table, indexed by WCHPHASE
+    phase: LandingPhase
+    new_phase_routine: Integer
+    preguide_routine: Integer
+    guidance_routine: Integer
+
+    @guidance
+        -- The tables NEWPHASE, PREGUIDE and the guidance equation
+        -- dispatch are indexed by WCHPHASE + 1 (since WCHPHASE = -1
+        -- is the first entry). Each entry is a CADR.
+}
+
+value DescentTargetParams {
+    target_altitude: Decimal
+    target_velocity: List<Decimal>
+    time_to_go: Decimal
+
+    @guidance
+        -- TTF/8 (time to go divided by 8) is the fundamental
+        -- timing variable for the landing guidance equations.
+        -- Target parameters change at each phase transition.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity Servicer {
+    -- Central powered-flight navigation executive
+    -- Runs as a PRIO22 (octal, = 18 decimal) job via FINDVAC
+    active: Boolean
+    guidance_mode: GuidanceMode?
+    state_vector: List<Decimal>
+    delta_v_accumulated: PipaReading?
+    cycle_count: Integer
+    gravity_vector: List<Decimal>
+
+    @guidance
+        -- SERVICER is dispatched as a job at PRIO22 (octal 22 =
+        -- decimal 18) via FINDVAC to obtain a VAC area for
+        -- interpretive computation.
+        --
+        -- Each cycle: read PIPAs, compensate for gravity and
+        -- rotation, update the state vector, call the active
+        -- guidance routine, issue engine commands. The cycle
+        -- repeats at roughly 2-second intervals, paced by
+        -- WAITLIST tasks.
+        --
+        -- The 1202 alarm during Apollo 11: SERVICER calls FINDVAC.
+        -- If no VAC area is available (all five in use), the
+        -- executive fires alarm 1201. If no core set is available,
+        -- alarm 1202. During the Apollo 11 landing, the rendezvous
+        -- radar was inadvertently left in AUTO, generating T4RUPT
+        -- interrupts that spawned jobs consuming executive resources.
+        -- SERVICER's FINDVAC call failed, producing alarm 1202.
+        -- The restart system recovered SERVICER at its phase-table
+        -- checkpoint and guidance continued.
+}
+
+entity LandingGuidanceState {
+    -- State for P63/P64/P65/P66
+    phase: LandingPhase
+    wchphase: Integer
+    target: DescentTargetParams
+    commanded_rod: Decimal
+    redesignation_offset: List<Decimal>
+    flight_sequence: List<FlightSequenceEntry>
+    manual_throttle_active: Boolean
+
+    -- WCHPHASE encodes the landing phase as an integer index
+    -- -1 = ignition_algorithm, 0 = braking, 1 = approach, 2 = vertical
+    phase_from_wchphase: phase = ignition_algorithm implies wchphase = -1
+
+    @guidance
+        -- The flight sequence table is the dispatch mechanism.
+        -- WCHPHASE indexes into parallel tables for the new-phase
+        -- start routine, pre-guidance computations and the guidance
+        -- equation itself. Phase transitions increment WCHPHASE
+        -- and are data-driven rather than hardcoded.
+        --
+        -- commanded_rod is the astronaut's rate-of-descent command
+        -- in P66 mode. The hand controller increments or decrements
+        -- by 1 ft/s per click.
+}
+
+entity AscentGuidanceState {
+    -- State for P12: ascent to orbit
+    active: Boolean
+    target_orbit_altitude: Decimal
+    target_orbit_velocity: Decimal
+    time_of_ignition: Decimal
+    engine_state: EngineState
+
+    @guidance
+        -- Ascent uses the ascent engine at full throttle
+        -- (no throttle modulation). The guidance targets a
+        -- specific insertion orbit defined by altitude and
+        -- velocity at cutoff. SERVICER provides state vector
+        -- updates throughout the burn.
+}
+
+entity ThrottleState {
+    -- Descent engine throttle state
+    engine: EngineId
+    engine_state: EngineState
+    commanded_thrust_fraction: Decimal
+    actual_thrust_fraction: Decimal
+    in_throttle_bucket: Boolean
+
+    -- The throttle bucket is the unstable region between ~10% and ~60%
+    bucket_lower: commanded_thrust_fraction <= config.throttle_bucket_lower
+    bucket_upper: commanded_thrust_fraction >= config.throttle_bucket_upper
+
+    @guidance
+        -- Throttle commands are written to channel 14 (discrete
+        -- bits for on/off and override) and a DAC channel for
+        -- the analogue throttle position.
+        --
+        -- The descent engine has a combustion instability region
+        -- between approximately 10% and 60% thrust. Commands
+        -- must either be at or below 10%, or at or above 60%.
+        -- The guidance equations are designed to avoid commanding
+        -- within this band, but the throttle control routine
+        -- enforces the constraint as a final safeguard.
+}
+
+entity TrimGimbalState {
+    -- Descent engine gimbal trim for CG compensation
+    pitch_trim: Decimal
+    roll_trim: Decimal
+    active: Boolean
+
+    @guidance
+        -- The descent engine is gimballed +/-6 degrees in pitch
+        -- and roll to keep the thrust vector through the vehicle
+        -- centre of gravity. As propellant is consumed, the CG
+        -- shifts and the trim must be updated.
+        --
+        -- Trim gimbal control runs as T5 (timer 5) tasks at a
+        -- high interrupt rate. The trim angles are computed from
+        -- the difference between the commanded and actual thrust
+        -- direction.
+}
+
+-- allium-ignore allium.entity.unused
+entity IgnitionSequence {
+    -- Master ignition routine state (BURN BABY BURN)
+    engine: EngineId
+    time_of_ignition: Decimal
+    countdown_active: Boolean
+    ullage_active: Boolean
+    engine_state: EngineState
+    servicer_ready: Boolean
+
+    @guidance
+        -- The master ignition routine coordinates the entire
+        -- engine start sequence:
+        -- 1. Compute and display time to TIG
+        -- 2. Begin ullage (RCS settling burns) before TIG
+        -- 3. Command engine on at TIG
+        -- 4. Verify thrust and hand off to guidance
+        --
+        -- The filename BURN_BABY_BURN--MASTER_IGNITION_ROUTINE
+        -- references 1960s Los Angeles radio DJ Magnificent
+        -- Montague, whose catchphrase "burn, baby, burn" was
+        -- adopted by programmer Peter Adler.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    servicer_priority: Integer = 18
+    servicer_cycle_interval: Decimal = 2.0
+    throttle_bucket_lower: Decimal = 0.10
+    throttle_bucket_upper: Decimal = 0.60
+    max_gimbal_angle: Decimal = 6.0
+    rod_increment: Decimal = 1.0
+    p66_initial_rod: Decimal = -3.0
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- SERVICER cycle -----------------------------------------------
+
+rule ServicerCycle {
+    -- SERVICER reads PIPAs, updates state vector, calls guidance
+    when: ServicerCycleTick(servicer)
+
+    requires:
+        servicer.active = true
+        servicer.guidance_mode != null
+
+    ensures:
+        let pipa = ReadPipas()
+        servicer.delta_v_accumulated = pipa
+        servicer.state_vector = UpdateStateVector(
+            servicer.state_vector,
+            pipa,
+            servicer.gravity_vector
+        )
+        servicer.cycle_count = servicer.cycle_count + 1
+        if servicer.guidance_mode = landing:
+            LandingGuidanceDispatch(landing_guidance: landing_guidance)
+        if servicer.guidance_mode = ascent:
+            AscentGuidanceCompute(ascent_guidance: ascent_guidance)
+
+    @guidance
+        -- SERVICER is the heartbeat of powered flight. All guidance
+        -- routines are called from within the SERVICER job, not as
+        -- independent jobs. SERVICER calls FINDVAC to obtain its
+        -- VAC area; if the executive is resource-starved (as during
+        -- the Apollo 11 1202 alarms), SERVICER fails to start and
+        -- the restart system must recover it.
+}
+
+rule ServicerResourceExhaustion {
+    -- SERVICER cannot obtain executive resources
+    when: ServicerCycleTick(servicer)
+
+    requires: servicer.active = true
+
+    ensures: Bailout(alarm_code: `1202`)
+
+    @guidance
+        -- This is the 1202 alarm path. SERVICER calls FINDVAC;
+        -- if no VAC area or core set is available, the executive
+        -- fires alarm 1202. The restart system detects SERVICER's
+        -- phase-table entry and re-enters it. During Apollo 11,
+        -- this happened several times during P63 and P64 due to
+        -- the rendezvous radar consuming executive resources.
+        -- The guidance computer recovered each time because the
+        -- restart system preserved SERVICER's phase checkpoint.
+}
+
+-- Landing guidance: P63 braking phase --------------------------
+
+rule LandingGuidanceBraking {
+    -- P63: quadratic guidance targeting braking-phase-end conditions
+    when: LandingGuidanceDispatch(landing_guidance)
+
+    requires:
+        landing_guidance.phase = braking
+        landing_guidance.wchphase = 0
+
+    ensures:
+        let command = ComputeBrakingGuidance(
+            landing_guidance.target,
+            servicer.state_vector,
+            servicer.gravity_vector
+        )
+        ThrottleCommand(
+            throttle: throttle,
+            thrust_fraction: command.throttle_fraction,
+            direction: command.thrust_direction
+        )
+
+    @guidance
+        -- BRAKQUAD: quadratic guidance law. Targets a specific
+        -- altitude and velocity at the braking-to-approach
+        -- transition point. TTF/8 counts down toward zero.
+        -- When the braking phase targets are met, WCHPHASE
+        -- transitions to 1 (approach).
+}
+
+-- Landing guidance: P64 approach phase -------------------------
+
+rule LandingGuidanceApproach {
+    -- P64: guidance to the landing site with redesignation
+    when: LandingGuidanceDispatch(landing_guidance)
+
+    requires:
+        landing_guidance.phase = approach
+        landing_guidance.wchphase = 1
+
+    ensures:
+        let command = ComputeApproachGuidance(
+            landing_guidance.target,
+            landing_guidance.redesignation_offset,
+            servicer.state_vector,
+            servicer.gravity_vector
+        )
+        ThrottleCommand(
+            throttle: throttle,
+            thrust_fraction: command.throttle_fraction,
+            direction: command.thrust_direction
+        )
+
+    @guidance
+        -- APPRQUAD: the approach phase guides toward the landing
+        -- site. The LPD (Landing Point Designator) angle is
+        -- displayed to the astronaut, who can see where the
+        -- computer is targeting. If the site looks unsuitable,
+        -- the astronaut can redesignate using the hand controller.
+}
+
+rule Redesignation {
+    -- Astronaut adjusts landing point during P64
+    when: Redesignation(offset_x, offset_y)
+
+    requires: landing_guidance.phase = approach
+
+    ensures:
+        landing_guidance.redesignation_offset =
+            ApplyRedesignation(landing_guidance.redesignation_offset, offset_x, offset_y)
+
+    @guidance
+        -- The hand controller generates lateral velocity increments
+        -- that shift the targeted landing point. The redesignation
+        -- offset is incorporated into the guidance equations on the
+        -- next SERVICER cycle. Each click moves the LPD angle by
+        -- a fixed increment.
+}
+
+-- Landing guidance: P65/P66 vertical descent -------------------
+
+rule LandingGuidanceVertical {
+    -- P65: automatic vertical descent (initial entry)
+    when: LandingGuidanceDispatch(landing_guidance)
+
+    requires:
+        landing_guidance.phase = vertical
+        landing_guidance.wchphase = 2
+        landing_guidance.manual_throttle_active = false
+
+    ensures:
+        let command = ComputeVerticalGuidance(
+            landing_guidance.commanded_rod,
+            servicer.state_vector
+        )
+        ThrottleCommand(
+            throttle: throttle,
+            thrust_fraction: command.throttle_fraction,
+            direction: command.thrust_direction
+        )
+
+    @guidance
+        -- P65 maintains a fixed rate of descent computed by the
+        -- guidance equations. Transitions to P66 when the astronaut
+        -- takes manual ROD control via the hand controller.
+}
+
+rule RateOfDescentManual {
+    -- P66: astronaut commands rate of descent
+    when: RodCommand(direction)
+
+    requires: landing_guidance.phase = vertical
+
+    ensures:
+        landing_guidance.manual_throttle_active = true
+        if direction = increase:
+            landing_guidance.commanded_rod =
+                landing_guidance.commanded_rod + config.rod_increment
+        if direction = decrease:
+            landing_guidance.commanded_rod =
+                landing_guidance.commanded_rod - config.rod_increment
+
+    @guidance
+        -- Each hand controller click adjusts the commanded descent
+        -- rate by 1 ft/s. The AGC maintains the commanded rate by
+        -- adjusting throttle on each SERVICER cycle. P66 is the
+        -- final phase before touchdown; Armstrong used it for the
+        -- last portion of the Apollo 11 landing.
+}
+
+-- Phase transitions --------------------------------------------
+
+rule PhaseTransitionBrakingToApproach {
+    -- WCHPHASE 0 -> 1: braking complete, enter approach
+    when: PhaseTransitionCheck(landing_guidance)
+
+    requires:
+        landing_guidance.phase = braking
+        landing_guidance.target.time_to_go <= 0
+
+    ensures:
+        landing_guidance.phase = approach
+        landing_guidance.wchphase = 1
+        landing_guidance.redesignation_offset = ZeroOffset()
+
+    @guidance
+        -- The transition fires when TTF/8 reaches zero (the
+        -- braking phase targets have been met). The flight
+        -- sequence table dispatches the APPRQUAD new-phase
+        -- routine which resets guidance state for approach.
+}
+
+rule PhaseTransitionApproachToVertical {
+    -- WCHPHASE 1 -> 2: approach complete, enter vertical descent
+    when: PhaseTransitionCheck(landing_guidance)
+
+    requires:
+        landing_guidance.phase = approach
+        landing_guidance.target.time_to_go <= 0
+
+    ensures:
+        landing_guidance.phase = vertical
+        landing_guidance.wchphase = 2
+        landing_guidance.commanded_rod = config.p66_initial_rod
+        landing_guidance.manual_throttle_active = false
+
+    @guidance
+        -- Transition to P65/P66. The initial rate of descent is
+        -- set to approximately -3 ft/s (descending). The astronaut
+        -- can then modulate via P66 hand controller inputs.
+}
+
+-- Ascent guidance: P12 -----------------------------------------
+
+rule AscentGuidance {
+    -- P12: powered ascent from lunar surface to orbit
+    when: AscentGuidanceCompute(ascent_guidance)
+
+    requires: ascent_guidance.active = true
+
+    ensures:
+        let command = ComputeAscentGuidance(
+            ascent_guidance.target_orbit_altitude,
+            ascent_guidance.target_orbit_velocity,
+            servicer.state_vector
+        )
+        ThrottleCommand(
+            throttle: throttle,
+            thrust_fraction: 1.0,
+            direction: command.thrust_direction
+        )
+
+    @guidance
+        -- Ascent guidance targets a specific insertion orbit.
+        -- The ascent engine has no throttle control; it runs at
+        -- full thrust. Guidance steers by commanding attitude
+        -- only. SERVICER provides the state vector updates.
+        -- Cutoff occurs when the target orbit conditions are met.
+}
+
+-- Master ignition routine --------------------------------------
+
+rule MasterIgnitionCountdown {
+    -- BURN BABY BURN: countdown to TIG
+    when: MasterIgnitionStart(sequence)
+
+    requires: sequence.countdown_active = false
+
+    ensures:
+        sequence.countdown_active = true
+        ScheduleUllage(sequence: sequence)
+
+    @guidance
+        -- P40/P41/P42 set up the master ignition routine.
+        -- The routine computes time to TIG and begins the
+        -- countdown sequence. It coordinates with SERVICER
+        -- to ensure the guidance state is initialised before
+        -- engine start.
+}
+
+rule MasterIgnitionUllage {
+    -- RCS settling burns before main engine start
+    when: UllageStart(sequence)
+
+    requires:
+        sequence.countdown_active = true
+        sequence.engine_state = off
+
+    ensures:
+        sequence.ullage_active = true
+        sequence.engine_state = ullage
+
+    @guidance
+        -- Ullage uses RCS thrusters to settle propellant in
+        -- the tanks before main engine ignition. Duration
+        -- depends on the engine and mission phase.
+}
+
+rule MasterIgnitionEngineOn {
+    -- Command engine on at TIG
+    when: EngineOnCommand(sequence)
+
+    requires:
+        sequence.countdown_active = true
+        sequence.servicer_ready = true
+
+    ensures:
+        sequence.engine_state = running
+        sequence.ullage_active = false
+        sequence.countdown_active = false
+
+    @guidance
+        -- At TIG, the engine on command is issued via channel 11
+        -- bit 13 (descent engine) or channel 14 bit 4 (ascent engine).
+        -- SERVICER must be running before the engine starts so
+        -- that guidance commands are available immediately.
+}
+
+-- Throttle control ---------------------------------------------
+
+rule ThrottleCommand {
+    -- Apply throttle command with bucket avoidance
+    when: ThrottleCommand(throttle, thrust_fraction, direction)
+
+    requires: throttle.engine = descent
+
+    ensures:
+        if thrust_fraction > config.throttle_bucket_lower
+            and thrust_fraction < config.throttle_bucket_upper:
+            -- Jump across the bucket
+            if thrust_fraction < (config.throttle_bucket_lower + config.throttle_bucket_upper) / 2:
+                throttle.commanded_thrust_fraction = config.throttle_bucket_lower
+            else:
+                throttle.commanded_thrust_fraction = config.throttle_bucket_upper
+        else:
+            throttle.commanded_thrust_fraction = thrust_fraction
+        throttle.actual_thrust_fraction = throttle.commanded_thrust_fraction
+
+    @guidance
+        -- THROTTLE CONTROL ROUTINES enforce the bucket constraint.
+        -- The descent engine's injector design creates combustion
+        -- instability between ~10% and ~60% thrust. The guidance
+        -- equations are designed to avoid this region, but the
+        -- throttle routine clamps as a safeguard. Commands below
+        -- the bucket go to the lower bound; commands above go to
+        -- the upper bound. The midpoint test determines which
+        -- side to clamp to.
+}
+
+rule ThrottleCommandAscent {
+    -- Ascent engine: full thrust only, no modulation
+    when: ThrottleCommand(throttle, thrust_fraction, direction)
+
+    requires: throttle.engine = ascent
+
+    ensures:
+        throttle.commanded_thrust_fraction = 1.0
+        throttle.actual_thrust_fraction = 1.0
+
+    @guidance
+        -- The ascent engine is not throttleable. It runs at
+        -- full thrust or off. The thrust_fraction parameter
+        -- is ignored.
+}
+
+-- Trim gimbal control ------------------------------------------
+
+rule TrimGimbalUpdate {
+    -- Adjust descent engine gimbal for CG offset
+    when: TrimGimbalTick(trim_gimbal)
+
+    requires: trim_gimbal.active = true
+
+    ensures:
+        let trim = ComputeGimbalTrim(
+            servicer.state_vector,
+            throttle.commanded_thrust_fraction
+        )
+        trim_gimbal.pitch_trim = clamp(
+            trim.pitch, -config.max_gimbal_angle, config.max_gimbal_angle
+        )
+        trim_gimbal.roll_trim = clamp(
+            trim.roll, -config.max_gimbal_angle, config.max_gimbal_angle
+        )
+
+    @guidance
+        -- Runs as T5 tasks at high rate. The gimbal actuators
+        -- are driven by the trim error (difference between
+        -- current and desired gimbal angle). The +/-6 degree
+        -- limit is a mechanical constraint of the actuators.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ThrottleNeverInBucket {
+    -- The descent engine must never be commanded into the
+    -- unstable thrust region.
+    throttle.engine = descent implies
+        throttle.commanded_thrust_fraction <= config.throttle_bucket_lower
+        or throttle.commanded_thrust_fraction >= config.throttle_bucket_upper
+        or throttle.engine_state = off
+}
+
+invariant ServicerPriority {
+    -- SERVICER always runs at the highest normal job priority.
+    servicer.active implies servicer.priority = config.servicer_priority
+}
+
+invariant GimbalWithinLimits {
+    trim_gimbal.active implies
+        trim_gimbal.pitch_trim >= -config.max_gimbal_angle
+        and trim_gimbal.pitch_trim <= config.max_gimbal_angle
+        and trim_gimbal.roll_trim >= -config.max_gimbal_angle
+        and trim_gimbal.roll_trim <= config.max_gimbal_angle
+}
+
+invariant AscentEngineFullThrust {
+    -- The ascent engine has no throttle modulation.
+    throttle.engine = ascent and throttle.engine_state = running implies
+        throttle.commanded_thrust_fraction = 1.0
+}
+
+invariant LandingPhaseMatchesWchphase {
+    landing_guidance.phase = ignition_algorithm implies landing_guidance.wchphase = -1
+    landing_guidance.phase = braking implies landing_guidance.wchphase = 0
+    landing_guidance.phase = approach implies landing_guidance.wchphase = 1
+    landing_guidance.phase = vertical implies landing_guidance.wchphase = 2
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Servicer.ReadPipas    -- see: Luminary099/SERVICER.agc
+    -- Reads PIPAX, PIPAY, PIPAZ and zeroes them. Compensates
+    -- for PIPA bias and scale factor. Returns a PipaReading.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Servicer.UpdateStateVector    -- see: Luminary099/SERVICER.agc
+    -- Integrates the state vector forward by one SERVICER
+    -- cycle using the PIPA readings and gravity model.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred LandingGuidanceState.ComputeBrakingGuidance    -- see: Luminary099/LUNAR_LANDING_GUIDANCE_EQUATIONS.agc
+    -- BRAKQUAD: quadratic guidance law for the braking phase.
+    -- Computes thrust direction and throttle to reach the
+    -- braking-to-approach transition targets.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred LandingGuidanceState.ComputeApproachGuidance    -- see: Luminary099/LUNAR_LANDING_GUIDANCE_EQUATIONS.agc
+    -- APPRQUAD: quadratic guidance for approach phase.
+    -- Incorporates redesignation offset into the target.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred LandingGuidanceState.ComputeVerticalGuidance    -- see: Luminary099/THE_LUNAR_LANDING.agc
+    -- Computes throttle to maintain the commanded rate of
+    -- descent during P65/P66.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred AscentGuidanceState.ComputeAscentGuidance    -- see: Luminary099/ASCENT_GUIDANCE.agc
+    -- Computes steering commands to reach the target
+    -- insertion orbit. Returns attitude commands only
+    -- (throttle is always full).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred TrimGimbalState.ComputeGimbalTrim    -- see: Luminary099/TRIM_GIMBAL_CONTROL_SYSTEM.agc
+    -- Computes pitch and roll trim angles from the
+    -- current state vector and thrust level.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "If SERVICER is repeatedly restarted due to executive resource exhaustion (cascading 1202 alarms), is there a limit on the number of restart attempts before the guidance is abandoned? During Apollo 11, the restarts succeeded because the underlying resource contention was intermittent. A sustained resource starvation scenario could produce an alarm loop. The restart spec's APTS counter may limit this, but the interaction between SERVICER phase protection and the alarm counter is not fully traced."
+
+open question "When the throttle command crosses the bucket region (e.g. guidance requests a transition from 80% to 5%), does the throttle jump instantaneously across the bucket, or does the throttle control routine command a specific slew rate through the transition? The source suggests an instantaneous jump, but the engine dynamics of passing through the unstable region even briefly are unclear."

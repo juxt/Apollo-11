@@ -1,0 +1,704 @@
+-- allium: 3
+-- Apollo Guidance Computer — Inertial Measurement Unit subsystem
+-- Mode switching, PIPA/gyro compensation, calibration and alignment
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    imu: Imu
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ImuMode { off | zeroing | coarse_align | fine_align | operate | caged }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value CduAngles {
+    x: Integer
+    y: Integer
+    z: Integer
+}
+
+value PipaReadings {
+    x: Integer
+    y: Integer
+    z: Integer
+}
+
+value PipaCompensationCoefficients {
+    -- Bias: pulses/cs, scaled 2(-8)
+    bias_x: Integer
+    bias_y: Integer
+    bias_z: Integer
+    -- Scale factor error: ppm, scaled 2(-9)
+    scale_factor_x: Integer
+    scale_factor_y: Integer
+    scale_factor_z: Integer
+
+    @guidance
+        -- PBIASX/Y/Z and PIPASCFX/Y/Z in erasable memory.
+        -- Pre-loaded for each flight unit. CM and LM have
+        -- different coefficients for their respective hardware.
+}
+
+value GyroCompensationCoefficients {
+    -- Acceleration-dependent drift: gyro pulses/pipa pulse, scaled 2(-3)
+    adia_x: Integer
+    adia_y: Integer
+    adia_z: Integer
+    -- Acceleration-dependent spin-reference axis: same scaling
+    adsra_x: Integer
+    adsra_y: Integer
+    adsra_z: Integer
+    -- Non-acceleration-dependent bias drift: gyro pulses/cs, scaled 2(-5)
+    nbd_x: Integer
+    nbd_y: Integer
+    nbd_z: Integer
+
+    @guidance
+        -- ADIAX/Y/Z, ADSRAX/Y/Z, NBDX/Y/Z in erasable memory.
+        -- The acceleration-dependent output axis terms (ADOAX/Y/Z)
+        -- are commented out in both Comanche055 and Luminary099.
+        -- They were zeroed for Apollo 11.
+}
+
+value GyroTorqueCommand {
+    -- Double-precision pulse count per axis
+    x: Integer
+    y: Integer
+    z: Integer
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity Imu {
+    mode: ImuMode
+    cdu_angles: CduAngles
+    pipa_readings: PipaReadings
+    pipa_coefficients: PipaCompensationCoefficients
+    gyro_coefficients: GyroCompensationCoefficients
+
+    -- IMODES30 and IMODES33: packed flag words tracking hardware state
+    imodes30: Integer
+    imodes33: Integer
+
+    -- Target angles for coarse alignment
+    target_angles: CduAngles?
+
+    -- LGYRO: gyro reservation flag. Non-zero means gyros busy.
+    gyros_busy: Boolean
+
+    -- GCOMPSW: gyro compensation switch. Positive when accumulated
+    -- commands exceed 2 pulses and need sending.
+    gyro_commands_pending: Boolean
+
+    -- MODECADR: stall synchronisation register for IMU operations.
+    -- +0 = operation incomplete, -1 = complete success, -0 = complete failure.
+    operation_pending: Boolean
+
+    -- Derived state
+    in_gimbal_lock: Boolean
+    coarse_align_active: Boolean
+
+    transitions mode {
+        off -> zeroing
+        off -> caged
+        zeroing -> operate
+        coarse_align -> fine_align
+        coarse_align -> caged
+        fine_align -> operate
+        fine_align -> coarse_align
+        operate -> zeroing
+        operate -> coarse_align
+        operate -> fine_align
+        operate -> caged
+        caged -> zeroing
+        caged -> coarse_align
+        terminal: off
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    coarse_align_tolerance_degrees: Decimal = 2.0
+    zero_settle_time_ms: Integer = 10000
+    fine_align_imufail_delay_ms: Integer = 5000
+    fine_align_settle_time_ms: Integer = 2000
+    min_gyro_pulse_train: Integer = 16
+    max_cdu_command_pulses: Integer = 192
+    gyro_drift_compensation_interval_cs: Integer = 8191
+    gimbal_lock_threshold_degrees: Integer = 70
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- IMU Zero (IMUZERO) ------------------------------------------
+
+rule ZeroImu {
+    -- Zeros the inertial CDU counters. First checks for gimbal lock
+    -- combined with coarse align, which would cause gimbal runaway.
+    when: ZeroImu()
+
+    requires:
+        not (imu.in_gimbal_lock and imu.coarse_align_active)
+        imu.mode != caged
+
+    ensures:
+        imu.mode = zeroing
+        imu.cdu_angles = CduAngles(x: 0, y: 0, z: 0)
+        ImuOperationStarted()
+
+    @guidance
+        -- IMUZERO inhibits interrupts, checks DSPTAB+11D bits 4 and 6
+        -- (gimbal lock + coarse align). If both set, alarm 206 and
+        -- immediate failure. Otherwise proceeds to zero CDUX/Y/Z,
+        -- waits 320ms for AGS pulse train, then 10 seconds for CDU
+        -- counters to find gimbal positions. Disables DAP auto/hold
+        -- modes during zeroing, inhibits ICDUFAIL and IMUFAIL.
+}
+
+rule ZeroImuGimbalLockReject {
+    -- Alarm 206: attempted CDU zero while in gimbal lock and coarse align.
+    when: ZeroImu()
+
+    requires:
+        imu.in_gimbal_lock
+        imu.coarse_align_active
+
+    ensures: Alarm(code: `206`)
+
+    @guidance
+        -- Gimbal runaway protection. If the IMU is in gimbal lock
+        -- AND coarse align mode, zeroing the CDUs would drive the
+        -- gimbals uncontrollably. The code checks bits 4 and 6 of
+        -- DSPTAB+11D and branches to CAGETSTJ+4 for immediate failure.
+}
+
+rule ZeroImuNotOperating {
+    -- Alarm 210: IMU not in operate mode when zeroing completes.
+    -- The zero proceeds but the alarm warns the operator.
+    when: ZeroImuComplete()
+
+    requires: not imu_is_operating(imu)
+
+    ensures: Alarm(code: `210`)
+}
+
+-- Coarse Align (IMUCOARS) ------------------------------------
+
+rule CoarseAlign {
+    -- Commands gimbals to target angles via CDU error counters.
+    -- Computes (THETAD - CDU) for each axis, sends pulse trains
+    -- in batches of up to 192 pulses per cycle.
+    when: CoarseAlign(target: CduAngles)
+
+    requires: imu.mode != caged
+
+    ensures:
+        imu.mode = coarse_align
+        imu.target_angles = target
+        imu.coarse_align_active = true
+        ImuOperationStarted()
+
+    @guidance
+        -- IMUCOARS sets BIT4 of channel 12 (coarse align mode),
+        -- clears error counters, disables DAP, inhibits IMUFAIL.
+        -- COARS computes the difference (THETAD - CDUX/Y/Z) in
+        -- ones-complement, shifts right 2, and loads CDU error
+        -- counter command registers. Pulses are sent via channel 14
+        -- bits 13-15. After all pulses sent, waits 1.5 seconds for
+        -- gimbals to settle, then checks each axis is within 2
+        -- degrees of target. Alarm 211 if not.
+}
+
+rule CoarseAlignVerification {
+    -- After pulse trains complete, gimbals must be within tolerance.
+    when: CoarseAlignComplete()
+
+    requires: all_axes_within_tolerance(imu, config.coarse_align_tolerance_degrees)
+
+    ensures:
+        imu.coarse_align_active = false
+        ImuOperationComplete(result: success)
+}
+
+rule CoarseAlignError {
+    -- Alarm 211: gimbals did not reach target within tolerance.
+    when: CoarseAlignComplete()
+
+    requires: not all_axes_within_tolerance(imu, config.coarse_align_tolerance_degrees)
+
+    ensures:
+        Alarm(code: `211`)
+        ImuOperationComplete(result: failure)
+}
+
+-- Fine Align (IMUFINE) ----------------------------------------
+
+rule FineAlign {
+    -- Precision alignment using gyro torquing. Clears coarse align
+    -- and zero discretes, enables DAP, then waits for settle time.
+    when: FineAlign()
+
+    requires: imu.mode != caged
+
+    ensures:
+        imu.mode = fine_align
+        imu.coarse_align_active = false
+        ImuOperationStarted()
+
+    @guidance
+        -- IMUFINE clears bits 4 and 5 of channel 12 (coarse align
+        -- and zero discretes). Re-enables DAP auto/hold. Schedules
+        -- IFAILOK at T+5s to re-enable IMUFAIL (was inhibited during
+        -- the preceding coarse align). Schedules IMUFINED at T+2s
+        -- to complete the mode switch. IFAILOK checks whether someone
+        -- has gone back into coarse align before re-enabling the fail
+        -- detection, preventing a race between align and fail logic.
+}
+
+-- IMU Operate -------------------------------------------------
+
+rule ImuOperate {
+    -- Normal operating mode. CDU angles track gimbal positions.
+    -- Entered after successful zero or fine align completion.
+    when: ImuOperationComplete(result: success)
+
+    requires: imu.mode = zeroing or imu.mode = fine_align
+
+    ensures:
+        imu.mode = operate
+        imu.operation_pending = false
+}
+
+rule ImuOperationFailed {
+    when: ImuOperationComplete(result: failure)
+
+    ensures:
+        imu.operation_pending = false
+
+    @guidance
+        -- BADEND sets MODECADR to -0 (operation complete, failed).
+        -- If a program is sleeping via IMUSTALL, it is woken and
+        -- returns at L+2 (failure path). If no program is waiting
+        -- yet, -0 is stored so IMUSTALL finds it immediately.
+}
+
+-- IMUSTALL ----------------------------------------------------
+
+rule ImuStallSleep {
+    -- Calling job sleeps until the current IMU operation completes.
+    -- The job's MODECADR is set to its return address.
+    when: ImuStall(job)
+
+    requires: imu.operation_pending = true
+
+    ensures:
+        JobSleep(job: job)
+
+    @guidance
+        -- IMUSTALL enters with A=0 (IMU device index). STALL checks
+        -- MODECADR via CCS:
+        --   +0: operation incomplete, go to MODESLP (JOBSLEEP)
+        --   -1: complete success, return at L+3
+        --   -0: complete failure, return at L+2
+        --   >0: two programs using same device, abort (alarm 1210)
+}
+
+rule ImuStallAlreadyComplete {
+    -- Operation finished before the caller reached IMUSTALL.
+    when: ImuStall(job)
+
+    requires: imu.operation_pending = false
+
+    ensures: ImuStallReturn(job: job)
+}
+
+rule ImuStallConflict {
+    -- Two programs attempting to use the IMU simultaneously.
+    -- MODECADR contains a positive CADR from a prior caller.
+    when: ImuStallConflict()
+
+    ensures: Abort(alarm_code: `1210`)
+
+    @guidance
+        -- MODABORT calls POODOO with OCT 1210. This triggers a
+        -- program restart that clears all MODECADR registers.
+}
+
+-- PIPA operations ---------------------------------------------
+
+rule PipaUse {
+    -- Marks PIPAs as in use by a program. Zeros PIPAX/Y/Z and
+    -- enables PIPA fail detection.
+    when: PipaUse()
+
+    requires: imu.mode != caged
+
+    ensures:
+        imu.pipa_readings = PipaReadings(x: 0, y: 0, z: 0)
+
+    @guidance
+        -- PIPUSE sets PIPAX/Y/Z to -0 (ones-complement zero),
+        -- then clears BIT1 of IMODES30 to enable PIPA fail
+        -- warnings. No IMUSTALL needed.
+}
+
+rule PipaFree {
+    -- Releases PIPAs. If a PIPA fail occurred during use, alarm 212.
+    when: PipaFree()
+
+    ensures:
+        if pipa_failed(imu):
+            Alarm(code: `212`)
+}
+
+-- PIPA Compensation (1/PIPA) ----------------------------------
+
+rule PipaCompensation {
+    -- Corrects accelerometer readings for bias and scale factor error.
+    -- For each axis: DELV += DELV * scale_factor - bias * delta_t
+    when: PipaCompensation(delta_t)
+
+    ensures:
+        compensate_pipa_readings(imu, delta_t)
+
+    @guidance
+        -- 1/PIPA runs under INHINT to ensure atomic compensation
+        -- of all three axes. For each axis (Z, Y, X in that order):
+        --   1. PIPASCF * DELVX -> scale factor correction
+        --   2. PIPABIAS * 1/PIPADT -> bias correction
+        -- The result is added to DELVX/Y/Z as double-precision.
+        -- After PIPA compensation, falls through to IRIGCOMP for
+        -- gyro drift compensation if GCOMPSW is non-negative.
+}
+
+-- Gyro Drift Compensation (NBDONLY / IRIGCOMP) ----------------
+
+rule GyroDriftCompensation {
+    -- Compensates for gyro drift using acceleration-dependent and
+    -- bias drift terms. Accumulates correction pulses in GCOMP.
+    when: GyroDriftCompensation()
+
+    ensures:
+        compensate_gyro_drift(imu)
+        if gyro_commands_exceed_threshold(imu):
+            imu.gyro_commands_pending = true
+
+    @guidance
+        -- IRIGCOMP processes X, Y, Z gyros sequentially. For each:
+        --   IRIGX: -(ADIAX)(PIPAX) + (ADSRAX)(PIPAY) - (NBDX)(DT)
+        --   IRIGY: -(ADIAY)(PIPAY) + (ADSRAY)(PIPAZ) - (NBDY)(DT)
+        --   IRIGZ: -(ADSRAZ)(PIPAY) - (ADIAZ)(PIPAZ) + (NBDZ)(DT)
+        -- Note the sign conventions differ per axis. The output axis
+        -- terms (ADOA) are commented out in Apollo 11 flight code.
+        -- If any accumulated command exceeds 2 pulses, GCOMPSW is
+        -- set positive and a PRIO21 job is created to run 1/GYRO,
+        -- which scales the commands and sends them via IMUPULSE.
+}
+
+rule GyroCommandDispatch {
+    -- When accumulated gyro corrections exceed the threshold,
+    -- a job is created to send the pulse trains.
+    when: imu: Imu.gyro_commands_pending becomes true
+
+    ensures:
+        GyroTorque(command: scaled_gyro_commands(imu))
+        imu.gyro_commands_pending = false
+
+    @guidance
+        -- 1/GYRO scales GCOMP values (shift right 7) for IMUPULSE
+        -- format, then falls through to IMUPULSE to send the
+        -- torquing commands. Created at PRIO21, higher than servicer
+        -- but lower than prelaunch calibration.
+}
+
+-- Gyro Torquing (IMUPULSE) ------------------------------------
+
+rule GyroTorque {
+    -- Sends gyro torquing pulse commands. Reserves the gyros,
+    -- enables power supply, and dispatches pulses per axis.
+    when: GyroTorque(command: GyroTorqueCommand)
+
+    requires:
+        imu.mode != caged
+        imu.gyros_busy = false
+
+    ensures:
+        imu.gyros_busy = true
+        GyroTorqueStarted()
+
+    @guidance
+        -- IMUPULSE saves the ECADR of the command registers, checks
+        -- for cage, then checks LGYRO. If gyros busy (LGYRO non-zero),
+        -- the calling job sleeps at GWAKE. Otherwise reserves gyros
+        -- by storing ECADR in LGYRO, enables power supply (BIT6 of
+        -- channel 14), and schedules STRTGYRO via waitlist.
+        --
+        -- STRTGYRO processes axes in order Y, Z, X (phase counter in
+        -- bits 13-14 of LGYRO). For each axis: selects the gyro via
+        -- channel 14 bits, tests command sign and magnitude, sends
+        -- positive or negative torque. Commands smaller than 16 pulses
+        -- are skipped. Large commands (>16383 pulses) are split into
+        -- 8192-pulse augments via 8192AUG.
+        --
+        -- When all three axes are done, LGYRO is zeroed and any
+        -- sleeping job at GWAKE is woken via JOBWAKE.
+}
+
+rule GyroTorqueBusy {
+    -- Gyros already reserved by another torquing operation.
+    -- Caller sleeps until LGYRO is cleared.
+    when: GyroTorque(command: GyroTorqueCommand)
+
+    requires: imu.gyros_busy = true
+
+    ensures:
+        JobSleep(job: calling_job())
+
+    @guidance
+        -- GYROBUSY saves the return 2FCADR in MPAC, then calls
+        -- JOBSLEEP at LGWAKE. When woken, GWAKE re-checks LGYRO.
+        -- If still busy, sleeps again. This is a spin-sleep pattern
+        -- without a bounded retry count.
+}
+
+-- Calibration and Alignment -----------------------------------
+
+rule CalculateGimbalAngles {
+    -- CALCGA: computes gimbal angles from a desired stable member
+    -- orientation (REFSMMAT) and the current CDU readings.
+    when: CalculateGimbalAngles(refsmmat)
+
+    ensures:
+        let angles = gimbal_angles_from_refsmmat(refsmmat, imu.cdu_angles)
+        imu.target_angles = angles
+
+    @guidance
+        -- CALCGA converts the desired stable member matrix into the
+        -- three gimbal angles needed for coarse alignment. The result
+        -- is stored in THETAD for use by IMUCOARS.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant NoCduZeroInGimbalLockCoarseAlign {
+    -- Gimbal runaway protection: cannot zero CDUs while in both
+    -- gimbal lock and coarse align.
+    imu.in_gimbal_lock and imu.coarse_align_active
+        implies imu.mode != zeroing
+}
+
+-- Gyro reservation exclusivity
+--
+-- Only one torquing operation uses the gyros at a time. LGYRO
+-- serves as a mutex. LGYRO = 0 means free. Non-zero holds the
+-- ECADR of the current command set, encoding both reservation
+-- and phase. This is enforced by the GYROBUSY sleep pattern
+-- rather than as a state invariant.
+
+-- Fine align follows coarse
+--
+-- Fine align is only entered from coarse align or operate mode.
+-- The hardware requires coarse positioning before precision
+-- torquing can converge. Encoded in the transitions block above.
+
+-- Operate requires alignment
+--
+-- The IMU enters operate mode only after a successful zero
+-- (CDUs synced to gimbals) or a successful fine align
+-- (stable member oriented to REFSMMAT). There is no direct
+-- path from off or caged to operate. Encoded in the transitions
+-- block above.
+
+------------------------------------------------------------
+-- Implementation notes
+------------------------------------------------------------
+
+-- IMODES30 flag word packing
+--
+-- BIT1:  PIPA fail enable (0 = enabled)
+-- BIT3:  ICDUFAIL inhibit
+-- BIT4:  IMUFAIL inhibit
+-- BIT5:  (used during zeroing)
+-- BIT6:  IMU cage flag
+-- BIT9:  IMU operate
+-- BIT10: PIP fail
+-- BIT13: IMU fail
+
+-- IMODES33 flag word packing
+--
+-- BIT5:  ground control
+-- BIT6:  DAP auto/hold disable
+-- BIT13: PIP fail program alarm enable
+
+-- MODECADR protocol
+--
+-- The MODECADR register synchronises mode-switching tasks with
+-- calling programs. Four states:
+--   +0: operation in progress, no caller waiting yet
+--   CADR (positive): caller sleeping, wake at this address
+--   -1: operation complete, success
+--   -0: operation complete, failure
+--
+-- GOODEND wakes a sleeping program (if MODECADR is a positive CADR)
+-- and advances LOC by 1 for success (return at L+3 vs L+2). BADEND
+-- stores -0. IMUSTALL checks MODECADR via CCS to determine which
+-- branch to take.
+
+-- CAGETEST / CAGETSTJ / CAGETSTQ
+--
+-- Three cage-checking subroutines used throughout mode switching:
+--   CAGETEST: if BIT6 of IMODES30 is set, branch to IMUBAD (task context)
+--   CAGETSTJ: if caged, set IMUCADR to -0 and exit (job initialisation)
+--   CAGETSTQ: skip one instruction if not caged (conditional skip)
+-- Every mode-switching task checks for cage at entry and after each
+-- WAITLIST delay, ensuring prompt abandonment if the IMU is caged
+-- mid-operation.
+
+-- Coarse align pulse generation
+--
+-- The CDU error counters accept at most 192 pulses per cycle (COMMAX).
+-- COARS computes the total error, then iterates: each cycle sends up
+-- to 192 pulses via CDUXCMD/CDUYCMD/CDUZCMD, waits 600ms for the
+-- pulse train, then repeats until the remaining command is zero.
+-- A final 1.5-second settle wait precedes the tolerance check.
+
+-- Gyro torque pulse splitting
+--
+-- Commands exceeding 16383 pulses are split into an initial segment
+-- plus N augments of 8192 pulses each. 8192AUG fires when the current
+-- train is nearly complete, adds BIT14 (8192) to GYROCMD, and
+-- reschedules itself until the stored major part counts down to zero.
+-- The last segment uses LASTSEG for precise timing.
+
+-- CM/LM differences
+--
+-- EBANK assignments differ: CM uses sextant/telescope mark buffer
+-- (MRKBUF1), LM uses AOT registers (AOTAZ). The LM IMUCAGE variant
+-- checks for descent engine activity before caging. Compensation
+-- coefficients differ per flight unit. The core mode-switching logic
+-- (IMUZERO, IMUCOARS, IMUFINE, IMUPULSE, IMUSTALL) is shared.
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Imu.all_axes_within_tolerance    -- see: Comanche055/IMU_MODE_SWITCHING_ROUTINES.agc, Luminary099/IMU_MODE_SWITCHING_ROUTINES.agc
+    -- CHKCORS: compares CDUX/Y/Z against THETAD for each axis.
+    -- Returns true if all three are within the given tolerance.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Imu.compensate_pipa_readings    -- see: Comanche055/IMU_COMPENSATION_PACKAGE.agc, Luminary099/IMU_COMPENSATION_PACKAGE.agc
+    -- 1/PIPA: for each axis (Z, Y, X), applies scale factor correction
+    -- (PIPASCF * DELV) and bias correction (PIPABIAS * 1/PIPADT).
+    -- Results are double-precision additions to DELVX/Y/Z.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Imu.compensate_gyro_drift    -- see: Comanche055/IMU_COMPENSATION_PACKAGE.agc, Luminary099/IMU_COMPENSATION_PACKAGE.agc
+    -- IRIGCOMP: for each gyro axis, computes acceleration-dependent
+    -- (ADIA, ADSRA) and bias drift (NBD) corrections. Accumulates
+    -- results in GCOMP registers as double-precision gyro pulses.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Imu.gimbal_angles_from_refsmmat    -- see: Comanche055/IMU_CALIBRATION_AND_ALIGNMENT.agc
+    -- CALCGA: matrix-to-gimbal-angle conversion. Uses the REFSMMAT
+    -- (reference stable member matrix) and current CDU readings to
+    -- compute the three gimbal angles for coarse alignment.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Imu.imu_is_operating    -- see: Comanche055/IMU_MODE_SWITCHING_ROUTINES.agc
+    -- Checks BIT9 of IMODES30 (ISS operate flag).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Imu.pipa_failed    -- see: Comanche055/IMU_MODE_SWITCHING_ROUTINES.agc
+    -- Checks BIT10 of IMODES30 (PIP fail flag).
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Imu.gyro_commands_exceed_threshold    -- see: Comanche055/IMU_COMPENSATION_PACKAGE.agc
+    -- Checks whether any GCOMP axis has accumulated more than 2
+    -- gyro pulses, warranting a torquing job.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred Imu.scaled_gyro_commands    -- see: Comanche055/IMU_COMPENSATION_PACKAGE.agc
+    -- 1/GYRO: scales GCOMP values (shift right 7) into the format
+    -- expected by IMUPULSE. Zeroes GCOMP after extraction.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+open question "If IMUSTALL's sleeping job is never woken because a mode-switching task terminates abnormally (neither GOODEND nor BADEND reached), the job remains asleep indefinitely. CAGETEST branches to IMUBAD which calls BADEND, and restart logic clears MODECADR registers. But is there a path where a waitlist task simply vanishes (e.g. via TASKOVER without reaching ENDIMU) leaving MODECADR at +0 permanently? The POODOO restart would eventually clean up, but the sleeping program has no timeout."
+
+-- CONFIRMED BUG: LGYRO not cleared on cage during torque
+--
+-- Traced through both Comanche055 and Luminary099. LGYRO (the
+-- gyro-busy lock) is set at IMUPULSE entry and only cleared at
+-- STRTGYR2 phase 3 completion (normal finish of all three axes).
+-- If the IMU is caged while torquing is in progress:
+--
+--   1. IMUPULSE sets LGYRO (reserves gyros)
+--   2. STRTGYRO is scheduled via WAITLIST
+--   3. Cage command arrives (physical cage button via channel 30
+--      bit 11, detected by T4RUPT IMUMON → IMUCAGE)
+--   4. STRTGYRO fires from WAITLIST, calls CAGETEST, detects cage
+--   5. CAGETEST → IMUBAD → BADEND: handles MODECADR bookkeeping
+--      but does NOT clear LGYRO
+--   6. LGYRO remains set permanently
+--   7. All subsequent IMUPULSE calls find LGYRO != 0, branch to
+--      GYROBUSY, sleep waiting for LGWAKE — which never comes
+--
+-- The same path exists via 8192AUG (multi-pulse augmentation):
+-- CAGETEST → IMUBAD → BADEND, LGYRO not cleared.
+--
+-- Impact: loss of all gyro torquing capability (fine alignment,
+-- drift compensation, any gyro-based operation) until a restart
+-- clears erasable memory.
+--
+-- The fix would require BADEND (or the IMUBAD path) to zero
+-- LGYRO before exiting. No such clearing code exists in either
+-- Comanche055 or Luminary099.
+--
+-- MITIGATING FACTOR: hardware restarts (GOJAM) DO clear LGYRO.
+-- STARTSUB zeroes LGYRO during restart initialisation (Comanche
+-- line 616, Luminary line 561). So the 1202-alarm restarts
+-- during Apollo 11 descent could not have triggered this bug.
+-- Restarts also kill all WAITLIST tasks including any pending
+-- STRTGYRO, preventing the stuck-lock scenario.
+--
+-- TRIGGER SCENARIO: the bug requires a cage event (physical
+-- button or hardware fault on channel 30 bit 11) while
+-- STRTGYRO is between phases. It cannot be triggered by a
+-- software restart. The vulnerability window is the duration
+-- of gyro torquing: roughly pulses/2 centiseconds per axis,
+-- typically milliseconds for drift compensation (NBDONLY) but
+-- potentially hundreds of milliseconds per axis for P52 fine
+-- alignment with large correction angles.
+--
+-- REAL-MISSION RISK: low but non-zero. Scenarios:
+-- - Accidental cage button press during P52 alignment
+-- - Hardware fault spuriously asserting channel 30 bit 11
+-- - Apollo 13: power transients during P52 could have toggled
+--   the cage bit without triggering a full restart, though in
+--   practice the transients did cause restarts (which self-heal)
+--
+-- Affects: both CM and LM (identical code paths).
+
+open question "The coarse align tolerance check (CHKCORS) compares CDU values against THETAD after a fixed 1.5-second settle wait. If mechanical friction or thermal effects cause slow settling, the check could fail spuriously (alarm 211). Is the 1.5-second wait empirically sufficient for all mission phases, or are there conditions (e.g. post-engine-burn thermal gradients) where it might be marginal?"

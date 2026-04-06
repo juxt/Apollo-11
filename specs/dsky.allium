@@ -1,0 +1,685 @@
+-- allium: 3
+-- Apollo Guidance Computer — DSKY subsystem
+-- Keyboard and display interface, verb-noun command language, uplink handling
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    dsky: DskyState
+    display: DisplayTable
+    uplink: UplinkState
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum InputSource { keyboard | internal | uplink }
+
+enum VerbCategory {
+    display         -- V01-V05: display data
+    | monitor       -- V11-V15: display with periodic update
+    | load          -- V21-V25: accept keyboard input
+    | special       -- V32-V37: recycle, proceed, terminate, fresh start, change program
+    | extended      -- V40+: dispatched to EXTENDED_VERBS module
+}
+
+enum NounCategory {
+    normal          -- N01-N39: specific erasable register groups
+    | mixed         -- N40-N99: heterogeneous data with different scaling
+}
+
+enum KeyCode {
+    digit_0 | digit_1 | digit_2 | digit_3 | digit_4
+    | digit_5 | digit_6 | digit_7 | digit_8 | digit_9
+    | verb | noun | plus | minus | enter
+    | key_release | error_reset | clear | proceed | terminate
+}
+
+enum FlashState { off | showing | blanked }
+
+-- allium-ignore allium.definition.unused
+enum AstronautResponse { proceed_response | terminate_response | enter_response }
+
+enum DskyId { nav_dsky | main_dsky }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value NounDefinition {
+    noun_code: Integer
+    category: NounCategory
+    component_count: Integer
+    scale_routine: Integer
+    register_addresses: List<Integer>
+    signed: Boolean
+    decimal: Boolean
+
+    invariant ValidCode {
+        noun_code >= 0 and noun_code <= 99
+    }
+
+    invariant ValidComponentCount {
+        component_count >= 1 and component_count <= 3
+    }
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity DskyState {
+    -- Current verb-noun state
+    current_verb: Integer
+    current_noun: Integer
+    verb_category: VerbCategory?
+    noun_definition: NounDefinition?
+
+    -- Display registers
+    r1: Integer?
+    r2: Integer?
+    r3: Integer?
+
+    -- Input state
+    input_buffer: List<KeyCode>
+    input_source: InputSource?
+
+    -- Busy lock: only one program can use the DSKY at a time
+    busy: Boolean
+    busy_owner: Integer?
+
+    -- Flash state
+    flash_state: FlashState
+
+    -- Priority display save area
+    saved_verb: Integer?
+    saved_noun: Integer?
+    saved_r1: Integer?
+    saved_r2: Integer?
+    saved_r3: Integer?
+    priority_display_active: Boolean
+
+    -- DSKY source identification
+    active_dsky: DskyId?
+
+    invariant ValidVerb {
+        current_verb >= 0 and current_verb <= 99
+    }
+
+    invariant ValidNoun {
+        current_noun >= 0 and current_noun <= 99
+    }
+}
+
+entity DisplayTable {
+    -- DSPTAB: 11 relay word entries + control word
+    entries: List<Integer>
+    pending_updates: Integer
+
+    invariant EntryCount {
+        entries.count = config.dsptab_entries
+    }
+
+    @guidance
+        -- Each entry encodes a relay word and relay number. The sign bit
+        -- marks whether the entry needs to be written to OUT0 by the
+        -- T4RUPT DSPOUT routine. NOUT tracks how many entries are pending.
+        -- DSPTAB+11D is a flag word checked first by DSPOUT.
+}
+
+entity UplinkState {
+    locked: Boolean
+    upact_light: Boolean
+
+    @guidance
+        -- UPLOCKFL is BIT4 of FLAGWRD7. When set, all uplink commands
+        -- except ERROR RESET are rejected. The UPACT light (BIT3 of
+        -- channel 11) illuminates whenever an uplink word is received,
+        -- regardless of whether it passes the redundancy check.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    dsptab_entries: Integer = 11
+    charin_priority: Integer = 30
+    flash_period_cs: Integer = 50
+    monitor_period_cs: Integer = 100
+    uplink_payload_bits: Integer = 5
+    max_verb_code: Integer = 99
+    max_noun_code: Integer = 99
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- KEYRUPT handling -----------------------------------------
+
+rule KeyruptReceive {
+    -- KEYRUPT1 (nav) or KEYRUPT2 (main) fires on key press.
+    -- Saves bank context, snapshots time for noun 65, reads
+    -- 5-bit key code from channel 15 or 16, sets DSKY flag
+    -- in FLAGWRD5, and creates a NOVAC job at CHARIN.
+    when: KeyPressed(key_code, source_dsky)
+
+    ensures:
+        dsky.active_dsky = source_dsky
+        CreateJobNovac(
+            entry_point: `CHARIN`,
+            priority: config.charin_priority,
+            bankset: `CHARIN_BANK`
+        )
+        dsky.input_source = keyboard
+
+    @guidance
+        -- The KEYRUPT handler pattern:
+        -- TS BANKRUPT / XCH Q / TS QRUPT (save context)
+        -- TC LODSAMPT (snapshot time for noun 65 last-key timing)
+        -- CA MNKEYIN (channel 15) or CA ch16 (channel 16)
+        -- MASK LOW5 (extract 5-bit key code)
+        -- TS RUPTSTOR (store for CHARIN)
+        -- TC POSTJUMP / CADR KEYCOM1 (set FLAGWRD5 BIT15, NOVAC)
+        -- TC RESUME
+        --
+        -- CHARIN runs as a priority 30 Executive job. Key processing
+        -- is cooperative, not interrupt-level.
+}
+
+-- Uplink handling -----------------------------------------
+
+rule UplinkReceive {
+    -- UPRUPT reads a 15-bit word from INLINK. The word carries
+    -- a 5-bit key code with triple redundancy: bits 1-5, 6-10
+    -- (same code), 11-15 (complemented code).
+    when: UplinkWordReceived(word)
+
+    ensures:
+        uplink.upact_light = true
+        UplinkRedundancyCheck(word: word)
+}
+
+rule UplinkCheckPass {
+    -- Triple redundancy check passes. The 15-bit uplink word
+    -- encodes the same 5-bit key code three times. All three
+    -- copies must agree (middle matches low, complement of high
+    -- matches low).
+    when: UplinkRedundancyCheck(word)
+
+    requires: triple_redundancy_valid(word)
+
+    ensures:
+        UplinkCodeAccepted(code: extract_key_code(word))
+
+    @guidance
+        -- The 15-bit word layout: bits 1-5 = key code, bits 6-10 =
+        -- same key code, bits 11-15 = complemented key code. The
+        -- check compares middle against low and complement-of-high
+        -- against low. This detects but cannot correct single-
+        -- character errors.
+}
+
+rule UplinkCheckFail {
+    -- Triple redundancy check fails. Lock out further uplink
+    -- until ERROR RESET is received.
+    when: UplinkRedundancyCheck(word)
+
+    requires: not triple_redundancy_valid(word)
+
+    ensures:
+        uplink.locked = true
+
+    @guidance
+        -- Sets UPLOCKFL (BIT4 of FLAGWRD7). All subsequent uplink
+        -- codes except ERROR RESET will be rejected until the ground
+        -- explicitly clears the lockout.
+}
+
+rule UplinkAcceptErrorReset {
+    -- ERROR RESET always accepted, clears lockout.
+    when: UplinkCodeAccepted(code)
+
+    requires: code = `error_reset_code`
+
+    ensures:
+        uplink.locked = false
+}
+
+rule UplinkAcceptNormal {
+    -- Normal uplink code accepted only when not locked out.
+    when: UplinkCodeAccepted(code)
+
+    requires:
+        code != `error_reset_code`
+        uplink.locked = false
+
+    ensures:
+        CreateJobNovac(
+            entry_point: `CHARIN`,
+            priority: config.charin_priority,
+            bankset: `CHARIN_BANK`
+        )
+        dsky.input_source = uplink
+}
+
+rule UplinkRejectLocked {
+    -- Uplink code rejected because lockout is active.
+    when: UplinkCodeAccepted(code)
+
+    requires:
+        code != `error_reset_code`
+        uplink.locked = true
+
+    ensures: UplinkRejected(code: code)
+}
+
+-- NVSUB — internal program interface ----------------------
+
+rule NvsubRequest {
+    -- Internal programs call NVSUB with verb/noun packed in A.
+    -- Bits 8-14 = verb, bits 1-7 = noun.
+    when: NvsubCall(verb_code, noun_code)
+
+    requires: dsky.busy = false
+
+    ensures:
+        dsky.current_verb = verb_code
+        dsky.current_noun = noun_code
+        dsky.busy = true
+        dsky.busy_owner = `calling_job`
+        dsky.input_source = internal
+        VerbDispatch(verb_code: verb_code, noun_code: noun_code)
+}
+
+rule NvsubBusyWait {
+    -- NVSBWAIT: DSKY is busy with another operation. The calling
+    -- job sleeps until the current user releases the DSKY.
+    when: NvsubCall(verb_code, noun_code)
+
+    requires: dsky.busy = true
+
+    ensures:
+        JobSleep(job: `calling_job`)
+
+    @guidance
+        -- The caller enters JOBSLEEP and will be woken when the
+        -- current DSKY user completes. There is no timeout on this
+        -- wait. If the busy owner dies without releasing the DSKY,
+        -- the waiting job sleeps indefinitely.
+}
+
+-- Verb dispatch -------------------------------------------
+
+rule DisplayVerbDispatch {
+    -- V01-V05: read noun registers, scale, write to DSPTAB.
+    when: VerbDispatch(verb_code, noun_code)
+
+    requires: verb_code >= 1 and verb_code <= 5
+
+    ensures:
+        NounRegisterRead(noun_code: noun_code, component: verb_code)
+        DisplayUpdate(register: verb_code)
+}
+
+rule MonitorVerbDispatch {
+    -- V11-V15: like display but re-execute once per second.
+    when: VerbDispatch(verb_code, noun_code)
+
+    requires: verb_code >= 11 and verb_code <= 15
+
+    ensures:
+        NounRegisterRead(noun_code: noun_code, component: verb_code - 10)
+        DisplayUpdate(register: verb_code - 10)
+        MonitorSchedule(verb_code: verb_code, noun_code: noun_code)
+
+    @guidance
+        -- Monitor verbs use a waitlist task to re-execute every
+        -- config.monitor_period_cs centiseconds. The display is not
+        -- truly real-time; there is 1-second granularity.
+}
+
+rule LoadVerbDispatch {
+    -- V21-V25: accept keyboard input into registers.
+    when: VerbDispatch(verb_code, noun_code)
+
+    requires: verb_code >= 21 and verb_code <= 25
+
+    ensures:
+        dsky.flash_state = showing
+        KeyboardInputWait(target_register: verb_code - 20)
+
+    @guidance
+        -- The display flashes to indicate the AGC is waiting for
+        -- astronaut input. The astronaut types digits then presses
+        -- ENTER. The value is converted and stored in the noun's
+        -- register for the specified component.
+}
+
+rule SpecialVerbRecycle {
+    -- V32: recycle — re-execute the current verb-noun.
+    when: VerbDispatch(verb_code: 32, noun_code)
+
+    ensures:
+        VerbDispatch(verb_code: dsky.current_verb, noun_code: dsky.current_noun)
+}
+
+rule SpecialVerbProceed {
+    -- V33: proceed — signal the waiting program to continue.
+    when: VerbDispatch(verb_code: 33, noun_code)
+
+    ensures:
+        dsky.flash_state = off
+        AstronautResponseReceived(response: proceed_response)
+}
+
+rule SpecialVerbTerminate {
+    -- V34: terminate — signal the waiting program to abort.
+    when: VerbDispatch(verb_code: 34, noun_code)
+
+    ensures:
+        dsky.flash_state = off
+        dsky.busy = false
+        dsky.busy_owner = null
+        AstronautResponseReceived(response: terminate_response)
+}
+
+rule SpecialVerbFreshStart {
+    -- V36: fresh start — restart the PINBALL state machine.
+    when: VerbDispatch(verb_code: 36, noun_code)
+
+    ensures:
+        dsky.busy = false
+        dsky.busy_owner = null
+        dsky.flash_state = off
+        dsky.priority_display_active = false
+        PinballFreshStart()
+}
+
+rule SpecialVerbChangeProgram {
+    -- V37: change major mode. Does not go through normal verb
+    -- dispatch. Calls V37 service routine which may trigger
+    -- ENEMA (software restart) to clean up the previous program.
+    when: VerbDispatch(verb_code: 37, noun_code)
+
+    ensures:
+        ChangeMajorMode(program_number: noun_code)
+
+    @guidance
+        -- V37 is special: the noun code is the desired program number,
+        -- not a noun table entry. The V37 handler validates the program
+        -- number and may perform ENEMA to terminate all current jobs
+        -- and restart the program environment.
+}
+
+rule ExtendedVerbDispatch {
+    -- V40+: dispatched to EXTENDED_VERBS module via jump table.
+    when: VerbDispatch(verb_code, noun_code)
+
+    requires: verb_code >= 40
+
+    ensures:
+        ExtendedVerbEntry(verb_code: verb_code, noun_code: noun_code)
+
+    @guidance
+        -- The extended verb jump table maps verb codes 40+ to handler
+        -- addresses in the EXTENDED_VERBS module. Notable entries:
+        -- V41 coarse align IMU, V42 fine align IMU, V46 G&C control,
+        -- V48 DAP data load, V49 crew-defined manoeuvre, V50 please
+        -- perform, V60-V69 system commands, V70-V73 update entries,
+        -- V74 mark data init, V82 orbit params, V83 rendezvous params,
+        -- V89 align IMU.
+}
+
+-- Flash display -------------------------------------------
+
+rule FlashCycleShow {
+    -- FLASHON job: transition from blanked to showing.
+    when: dsky: DskyState.flash_state transitions_to showing
+
+    requires: dsky.flash_state = blanked
+
+    ensures:
+        DisplayRestore()
+        WaitlistSchedule(
+            delay: config.flash_period_cs,
+            task: `FLASH_BLANK`
+        )
+}
+
+rule FlashCycleBlank {
+    -- FLASHON job: transition from showing to blanked.
+    when: dsky: DskyState.flash_state transitions_to blanked
+
+    requires: dsky.flash_state = showing
+
+    ensures:
+        DisplayBlank()
+        WaitlistSchedule(
+            delay: config.flash_period_cs,
+            task: `FLASH_SHOW`
+        )
+
+    @guidance
+        -- The flash mechanism runs as an Executive job using JOBSLEEP
+        -- to wait between cycles. If the Executive is overloaded,
+        -- flash timing may be irregular.
+}
+
+-- Astronaut response to flashing display ------------------
+
+rule EnterKeyResponse {
+    -- Astronaut presses ENTER during a flashing display (load verb).
+    when: KeyProcessed(key_code: enter)
+
+    requires: dsky.flash_state != off
+
+    ensures:
+        dsky.flash_state = off
+        AstronautResponseReceived(response: enter_response)
+}
+
+-- Key release and priority display ------------------------
+
+rule PriorityDisplayRequest {
+    -- A program requests a priority display, interrupting the
+    -- current display. Save current state for later restoration.
+    when: PriorityDisplayRequest(verb_code, noun_code)
+
+    ensures:
+        dsky.saved_verb = dsky.current_verb
+        dsky.saved_noun = dsky.current_noun
+        dsky.saved_r1 = dsky.r1
+        dsky.saved_r2 = dsky.r2
+        dsky.saved_r3 = dsky.r3
+        dsky.priority_display_active = true
+        dsky.current_verb = verb_code
+        dsky.current_noun = noun_code
+        VerbDispatch(verb_code: verb_code, noun_code: noun_code)
+
+    @guidance
+        -- The interrupted display state is saved via CADRSTOR for
+        -- restoration when the astronaut presses KEY RELEASE.
+}
+
+rule KeyReleaseRestore {
+    -- KEY RELEASE pressed while a priority display is active.
+    -- Restore the interrupted display.
+    when: KeyProcessed(key_code: key_release)
+
+    requires: dsky.priority_display_active = true
+
+    ensures:
+        dsky.current_verb = dsky.saved_verb
+        dsky.current_noun = dsky.saved_noun
+        dsky.r1 = dsky.saved_r1
+        dsky.r2 = dsky.saved_r2
+        dsky.r3 = dsky.saved_r3
+        dsky.priority_display_active = false
+        dsky.saved_verb = null
+        dsky.saved_noun = null
+}
+
+rule KeyReleaseNoop {
+    -- KEY RELEASE pressed with no priority display active.
+    when: KeyProcessed(key_code: key_release)
+
+    requires: dsky.priority_display_active = false
+
+    ensures: NoEffect()
+}
+
+-- DSKY release --------------------------------------------
+
+rule DskyRelease {
+    -- The busy owner releases the DSKY, waking any waiting job.
+    when: DskyRelease(owner)
+
+    requires:
+        dsky.busy = true
+        dsky.busy_owner = owner
+
+    ensures:
+        dsky.busy = false
+        dsky.busy_owner = null
+}
+
+-- Display output ------------------------------------------
+
+rule DisplayTableUpdate {
+    -- DSPTAB entry modified. Mark entry for output by T4RUPT
+    -- DSPOUT routine.
+    when: DisplayUpdate(register)
+
+    ensures:
+        display.pending_updates = display.pending_updates + 1
+
+    @guidance
+        -- The sign bit of each DSPTAB entry marks it as needing
+        -- output. T4RUPT's CDRVE/DSPOUT routine scans entries and
+        -- writes changed ones to the OUT0 channel. NOUT tracks
+        -- the count of pending entries.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant SingleDskyUser {
+    -- At most one program owns the DSKY at a time.
+    dsky.busy implies dsky.busy_owner != null
+}
+
+invariant FlashRequiresBusy {
+    -- Flashing display only active when some program owns the DSKY.
+    dsky.flash_state != off implies dsky.busy = true
+}
+
+invariant PriorityDisplayHasSavedState {
+    -- An active priority display always has saved state to restore.
+    dsky.priority_display_active implies dsky.saved_verb != null
+}
+
+invariant UplinkLockoutSafety {
+    -- A locked uplink rejects all non-reset codes.
+    -- (expressed behaviourally through UplinkRejectLocked rule)
+    uplink.locked implies not UplinkAcceptsNonReset()
+}
+
+------------------------------------------------------------
+-- Implementation notes
+------------------------------------------------------------
+
+-- CHARIN as Executive job
+--
+-- Keyboard input processing runs at priority 30 (octal 30000)
+-- as a NOVAC job. This is cooperative multitasking: CHARIN can
+-- be preempted by any higher-priority job. During heavy computation
+-- (e.g. P63 powered descent guidance), keyboard responsiveness
+-- may degrade noticeably.
+
+-- DSPTAB output mechanism
+--
+-- T4RUPT fires every 120ms. The DSPOUT subroutine within T4RUPT
+-- scans DSPTAB for entries with the sign bit set (needs update),
+-- writes them to OUT0, and clears the sign bit. At most NOUT
+-- entries are written per cycle. The display hardware latches
+-- relay words, so each digit/indicator only needs to be written
+-- when its value changes.
+
+-- Verb-noun encoding
+--
+-- NVSUB receives the verb-noun pair packed in the accumulator:
+-- bits 8-14 (7 bits) encode the verb, bits 1-7 encode the noun.
+-- This limits both to 0-127, though only 0-99 are used. The
+-- PINBALL noun tables (PINBALL_NOUN_TABLES) define the register
+-- addresses, scale routines and format for each noun code.
+
+-- Monitor verb timing
+--
+-- Monitor verbs (V11-V15) schedule a waitlist task that re-reads
+-- and re-displays the noun's registers every 1 second. The actual
+-- update rate is limited by waitlist granularity and T4RUPT
+-- display output timing. Combined worst-case latency from data
+-- change to display update is approximately 1.12 seconds.
+
+-- Extended verb dispatch
+--
+-- Verbs 40 and above are dispatched through a jump table in
+-- PINBALL to the EXTENDED_VERBS module. The table maps verb code
+-- minus 40 to a CADR. This separation keeps mission-specific
+-- verb implementations out of the core PINBALL code.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+open question "What is the worst-case keyboard latency under heavy Executive load? CHARIN runs at priority 30, which is relatively low. If higher-priority jobs (e.g. guidance cycle at priority 37) are continuously running, CHARIN may be starved. The AGC has no preemption timeout or priority inheritance mechanism. In the worst case, a key press could go unprocessed for multiple guidance cycles."
+
+open question "Can the DSKY lock up if the busy owner terminates abnormally? ENDOFJOB releases core sets and VAC areas but does not clear DSKY busy state. If a job that called NVSUB is terminated by a restart or alarm without going through normal completion, the DSKY busy flag may remain set, blocking all subsequent NVSUB callers indefinitely. V36 (fresh start) would clear this, but requires astronaut intervention."
+
+-- Resolved: priority display nesting is safe
+--
+-- CADRSTOR is a single-level save area (one register pair), but
+-- the code at MAKEPRIO (Comanche055/PINBALL_GAME_BUTTONS_AND_LIGHTS
+-- lines 736-739) explicitly checks FLAGWRD4 bits for an active
+-- priority display before proceeding. If one is already active,
+-- it branches to PRIOBORT which calls POODOO with alarm 1502.
+-- A nested priority display is rejected before it can overwrite
+-- CADRSTOR. The interrupted display's saved state is protected.
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DskyState.NounRegisterRead    -- see: Comanche055/PINBALL_NOUN_TABLES.agc, Luminary099/PINBALL_NOUN_TABLES.agc
+    -- Looks up the noun code in the noun table, reads the
+    -- specified component's register address, applies the
+    -- scale routine, and returns the formatted value.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DskyState.KeyboardInputWait    -- see: Comanche055/PINBALL_GAME_BUTTONS_AND_LIGHTS.agc
+    -- Waits for the astronaut to type digits and press ENTER.
+    -- Converts the decimal input to internal representation
+    -- and stores in the target register.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DskyState.ChangeMajorMode    -- see: Comanche055/PINBALL_GAME_BUTTONS_AND_LIGHTS.agc
+    -- V37 handler. Validates the program number, terminates
+    -- the current program environment (possibly via ENEMA),
+    -- and starts the requested program.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred DskyState.ExtendedVerbEntry    -- see: Comanche055/EXTENDED_VERBS.agc, Luminary099/EXTENDED_VERBS.agc
+    -- Jump table dispatch for verbs 40+. Each entry is a CADR
+    -- to the verb's handler in the EXTENDED_VERBS module.
+
+-- allium-ignore allium.deferred.missingLocationHint
+deferred UplinkState.UplinkAcceptsNonReset    -- see: Comanche055/KEYRUPT_UPRUPT.agc
+    -- Predicate: true when the uplink path would accept a
+    -- non-error-reset code. False when UPLOCKFL is set.
